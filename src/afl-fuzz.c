@@ -25,6 +25,7 @@
 
 #include "afl-fuzz.h"
 #include "cmplog.h"
+#include "patalog.h"
 #include "common.h"
 #include <limits.h>
 #include <stdlib.h>
@@ -51,6 +52,15 @@ static void at_exit() {
   char *list[4] = {SHM_ENV_VAR, SHM_FUZZ_ENV_VAR, CMPLOG_SHM_ENV_VAR, NULL};
   char *ptr;
 
+  ptr = getenv("__AFL_TARGET_PID3");
+  if (ptr && *ptr && (pid2 = atoi(ptr)) > 0) {
+
+    pgrp = getpgid(pid2);
+    if (pgrp > 0) { killpg(pgrp, SIGTERM); }
+    kill(pid2, SIGTERM);
+
+  }
+  
   ptr = getenv("__AFL_TARGET_PID2");
   if (ptr && *ptr && (pid2 = atoi(ptr)) > 0) {
 
@@ -556,7 +566,7 @@ int main(int argc, char **argv_orig, char **envp) {
   while (
       (opt = getopt(
            argc, argv,
-           "+Ab:B:c:CdDe:E:hi:I:f:F:g:G:l:L:m:M:nNOo:p:RQs:S:t:T:UV:WXx:YZ")) >
+           "+Ab:B:c:CdDe:E:hi:I:f:F:g:G:l:L:m:M:nNOo:p:RQs:S:t:T:UV:WXx:YZP:")) >
       0) {
 
     switch (opt) {
@@ -597,6 +607,12 @@ int main(int argc, char **argv_orig, char **envp) {
         afl->cmplog_binary = ck_strdup(optarg);
         break;
 
+      }
+
+      case 'P': {
+        afl->shm.patalog_mode = 1;
+        afl->patalog_binary = ck_strdup(optarg);
+        break;
       }
 
       case 's': {
@@ -1339,6 +1355,7 @@ int main(int argc, char **argv_orig, char **envp) {
   }
 
   if (afl->fsrv.mem_limit && afl->shm.cmplog_mode) afl->fsrv.mem_limit += 260;
+  if (afl->fsrv.mem_limit && afl->shm.patalog_mode) afl->fsrv.mem_limit += 260;
 
   OKF("afl++ is maintained by Marc \"van Hauser\" Heuse, Heiko \"hexcoder\" "
       "Eißfeldt, Andrea Fioraldi and Dominik Maier");
@@ -1502,6 +1519,13 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  if (afl->shm.patalog_mode &&
+      (!strcmp("-", afl->patalog_binary) || !strcmp("0", afl->patalog_binary))) {
+
+    afl->patalog_binary = strdup(argv[optind]);
+
+  }
+
   if (strchr(argv[optind], '/') == NULL && !afl->unicorn_mode) {
 
     WARNF(cLRD
@@ -1549,6 +1573,7 @@ int main(int argc, char **argv_orig, char **envp) {
   }
 
   if (afl->shm.cmplog_mode) { OKF("CmpLog level: %u", afl->cmplog_lvl); }
+  if (afl->shm.patalog_mode) { OKF("PataLog enabled"); }
 
   /* Dynamically allocate memory for AFLFast schedules */
   if (afl->schedule >= FAST && afl->schedule <= RARE) {
@@ -1988,6 +2013,23 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  if (afl->patalog_binary) {
+
+    if (afl->unicorn_mode) {
+
+      FATAL("PataLog and Unicorn mode are not compatible at the moment, sorry");
+
+    }
+
+    if (!afl->fsrv.qemu_mode && !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
+        !afl->non_instrumented_mode) {
+
+      check_binary(afl, afl->patalog_binary);
+
+    }
+
+  }
+
   check_binary(afl, argv[optind]);
 
   #ifdef AFL_PERSISTENT_RECORD
@@ -2170,6 +2212,79 @@ int main(int argc, char **argv_orig, char **envp) {
     }
 
     OKF("Cmplog forkserver successfully started");
+
+  }
+
+  if (afl->patalog_binary) {
+
+    ACTF("Spawning patalog forkserver");
+    afl_fsrv_init_dup(&afl->patalog_fsrv, &afl->fsrv);
+    // TODO: this is semi-nice
+    afl->patalog_fsrv.trace_bits = afl->fsrv.trace_bits;
+    afl->patalog_fsrv.cs_mode = afl->fsrv.cs_mode;
+    afl->patalog_fsrv.qemu_mode = afl->fsrv.qemu_mode;
+    afl->patalog_fsrv.frida_mode = afl->fsrv.frida_mode;
+    afl->patalog_fsrv.patalog_binary = afl->patalog_binary;
+    afl->patalog_fsrv.target_path = afl->fsrv.target_path;
+    afl->patalog_fsrv.init_child_func = patalog_exec_child;
+    afl->patalog_fsrv.add_pata_metadata = (void (*)(void *, u8 *, u32)) & add_pata_metadata;
+    afl->patalog_fsrv.reserve_metadata = (void (*)(void *, u32)) & reserve_metadata;
+    afl->patalog_fsrv.afl_ptr = (void*)afl;
+
+    if ((map_size <= DEFAULT_SHMEM_SIZE ||
+         afl->patalog_fsrv.map_size < map_size) &&
+        !afl->non_instrumented_mode && !afl->fsrv.qemu_mode &&
+        !afl->fsrv.frida_mode && !afl->unicorn_mode && !afl->fsrv.cs_mode &&
+        !afl->afl_env.afl_skip_bin_check) {
+
+      afl->patalog_fsrv.map_size = MAX(map_size, (u32)DEFAULT_SHMEM_SIZE);
+      char vbuf[16];
+      snprintf(vbuf, sizeof(vbuf), "%u", afl->patalog_fsrv.map_size);
+      setenv("AFL_MAP_SIZE", vbuf, 1);
+
+    }
+
+    u32 new_map_size =
+        afl_fsrv_get_mapsize(&afl->patalog_fsrv, afl->argv, &afl->stop_soon,
+                             afl->afl_env.afl_debug_child);
+
+    // only reinitialize when it needs to be larger
+    if (map_size < new_map_size) {
+
+      OKF("Re-initializing maps to %u bytes due patalog", new_map_size);
+
+      afl->virgin_bits = ck_realloc(afl->virgin_bits, new_map_size);
+      afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_map_size);
+      afl->virgin_crash = ck_realloc(afl->virgin_crash, new_map_size);
+      afl->var_bytes = ck_realloc(afl->var_bytes, new_map_size);
+      afl->top_rated =
+          ck_realloc(afl->top_rated, new_map_size * sizeof(void *));
+      afl->clean_trace = ck_realloc(afl->clean_trace, new_map_size);
+      afl->clean_trace_custom =
+          ck_realloc(afl->clean_trace_custom, new_map_size);
+      afl->first_trace = ck_realloc(afl->first_trace, new_map_size);
+      afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, new_map_size);
+
+      afl_fsrv_kill(&afl->fsrv);
+      afl_fsrv_kill(&afl->patalog_fsrv);
+      afl_shm_deinit(&afl->shm);
+
+      afl->patalog_fsrv.map_size = new_map_size;  // non-cmplog stays the same
+      map_size = new_map_size;
+
+      setenv("AFL_NO_AUTODICT", "1", 1);  // loaded already
+      setenv("AFL_NO_PATALOG", "1", 1);  // loaded already
+      afl->fsrv.trace_bits =
+          afl_shm_init(&afl->shm, new_map_size, afl->non_instrumented_mode);
+      afl->patalog_fsrv.trace_bits = afl->fsrv.trace_bits;
+      afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
+                     afl->afl_env.afl_debug_child);
+      afl_fsrv_start(&afl->patalog_fsrv, afl->argv, &afl->stop_soon,
+                     afl->afl_env.afl_debug_child);
+
+    }
+
+    OKF("Patalog forkserver successfully started");
 
   }
 

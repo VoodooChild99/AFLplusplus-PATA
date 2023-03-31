@@ -57,6 +57,7 @@ static u8  *lto_flag = AFL_CLANG_FLTO, *argvnull;
 static u8   debug;
 static u8   cwd[4096];
 static u8   cmplog_mode;
+static u8   patalog_mode;
 u8          use_stdin;                                             /* dummy */
 static int  passthrough;
 // static u8 *march_opt = CFLAGS_OPT;
@@ -2293,6 +2294,16 @@ int main(int argc, char **argv, char **envp) {
 
   cmplog_mode = getenv("AFL_CMPLOG") || getenv("AFL_LLVM_CMPLOG") ||
                 getenv("AFL_GCC_CMPLOG");
+  patalog_mode = getenv("AFL_PATALOG") || getenv("AFL_LLVM_PATALOG");
+
+  if (cmplog_mode && patalog_mode) {
+    FATAL("Cannot enalbe CMPLOG and PATALOG at the same time.");
+  }
+  if (patalog_mode) {
+    if (!lto_mode && instrument_mode != INSTRUMENT_PCGUARD) {
+      FATAL("PATALOG must be used with LTO or PCGUARD.");
+    }
+  }
 
 #if !defined(__ANDROID__) && !defined(ANDROID)
   ptr = find_object("afl-compiler-rt.o", argv[0]);

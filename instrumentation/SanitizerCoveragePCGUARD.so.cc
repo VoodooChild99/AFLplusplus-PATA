@@ -50,6 +50,12 @@
 #include "debug.h"
 #include "afl-llvm-common.h"
 
+extern "C" {
+
+#include "patalog.h"
+
+}
+
 using namespace llvm;
 
 #define DEBUG_TYPE "sancov"
@@ -73,6 +79,14 @@ const char SanCovModuleCtorTracePcGuardName[] =
 const char SanCovModuleCtor8bitCountersName[] =
     "sancov.module_ctor_8bit_counters";
 const char SanCovModuleCtorBoolFlagName[] = "sancov.module_ctor_bool_flag";
+/* PATA begin */
+const char SanCovModuleCtorPataGuardName[] = 
+    "sancov.module_ctor_pata_guard";
+const char SanCovModuleCtorPataMetadataPtrName[] = 
+    "sancov.module_ctor_pata_metadata_ptr";
+const char SanCovModuleCtorPataMetadataName[] = 
+    "sancov.module_ctor_pata_metadata";
+/* PATA end */
 static const uint64_t SanCtorAndDtorPriority = 2;
 
 const char SanCovTracePCGuardName[] = "__sanitizer_cov_trace_pc_guard";
@@ -80,11 +94,21 @@ const char SanCovTracePCGuardInitName[] = "__sanitizer_cov_trace_pc_guard_init";
 const char SanCov8bitCountersInitName[] = "__sanitizer_cov_8bit_counters_init";
 const char SanCovBoolFlagInitName[] = "__sanitizer_cov_bool_flag_init";
 const char SanCovPCsInitName[] = "__sanitizer_cov_pcs_init";
+/* PATA begin */
+const char SanCovPataGuardInitName[] = "__sanitizer_pata_guard_init";
+const char SanCovPataMetadataInitName[] = "__sanitizer_pata_metadata_init";
+const char SanCovPataMetadataPtrInitName[] = "__sanitizer_pata_metadata_ptr_init";
+/* PATA end */
 
 const char SanCovGuardsSectionName[] = "sancov_guards";
 const char SanCovCountersSectionName[] = "sancov_cntrs";
 const char SanCovBoolFlagSectionName[] = "sancov_bools";
 const char SanCovPCsSectionName[] = "sancov_pcs";
+/* PATA begin */
+const char SanCovPataGuardSectionName[] = "sancov_pata_guard";
+const char SanCovPataMetadataSectionName[] = "sancov_pata_metadata";
+const char SanCovPataMetadataPtrSectionName[] = "sancov_pata_metadata_ptr";
+/* PATA end */
 
 const char SanCovLowestStackName[] = "__sancov_lowest_stack";
 
@@ -207,6 +231,33 @@ class ModuleSanitizerCoverageAFL
   ConstantInt    *One = NULL;
   ConstantInt    *Zero = NULL;
 
+  /* PATA begin */
+  uint8_t patalog_mode = 0;
+  uint32_t pata_global_id = 0;
+  std::map<Value*, uint32_t> value_to_type;
+  std::map<BasicBlock*, Constant*> block_to_id;
+  GlobalVariable *ModulePataMetadata, *ModulePataMetadataPtr;
+  GlobalVariable *PataTmpGuardArray;
+
+  StructType *PataMetadataTy;
+  PointerType *PataMetadataPtrTy;
+  Type *VoidTy;
+  IntegerType *Int128Ty;
+  PointerType *voidPtrTy;
+  PointerType *Int32PtrPtrTy, *Int32PtrPtrPtrTy;
+  Constant *Null;
+
+  GlobalVariable *CreateModuleDataInSection(Type *Ty, const char *Section);
+  void initializePataGlobals(Module &M);
+  bool hookCmps(Module &M);
+  bool hookSwitches(Module &M);
+  bool hookRtns(Module &M);
+  Constant *collectBlockFeatures(Module &M, Instruction &I, u32 cur_id,
+                                 const char *ptr_name_prefix,
+                                 const char *name_prefix,
+                                 u32 &num_succ, Constant *&bf);
+  void InjectCoverageForPata(Function &F, BasicBlock &BB);
+  /* PATA end */
 };
 
 }  // namespace
@@ -235,6 +286,1507 @@ llvmGetPassPluginInfo() {
 }
 
 #endif
+
+/* PATA begin */
+template <class Iterator>
+Iterator Unique(Iterator first, Iterator last) {
+
+  while (first != last) {
+
+    Iterator next(first);
+    last = std::remove(++next, last, *first);
+    first = next;
+
+  }
+
+  return last;
+
+}
+
+Constant* ModuleSanitizerCoverageAFL::
+collectBlockFeatures(Module &M, Instruction &I, u32 cur_id,
+                     const char *ptr_name_prefix, const char *name_prefix,
+                     u32 &num_succ, Constant *&bf) {
+  uint32_t num_successors = 0;
+  std::vector<Constant*> successor_ids;
+  for (auto PB : successors(I.getParent())) {
+    if (block_to_id.find(PB) == block_to_id.end()) {
+      // the successor is not instrumented, so let's instrument it first
+      InjectCoverageForPata(*PB->getParent(), *PB);
+    }
+    num_successors += 1;
+    successor_ids.push_back(block_to_id[PB]);
+  }
+  num_succ = num_successors;
+  // different from LTO, we hold pointers to block ids here
+  if (num_successors) {
+    // Ptr array
+    auto global_name = ptr_name_prefix + std::to_string(cur_id);
+    auto tmp_ty = ArrayType::get(Int32PtrTy, num_successors);
+    M.getOrInsertGlobal(global_name, tmp_ty);
+    auto bf_ptr = M.getNamedGlobal(global_name);
+    // avoid name collisions
+    bf_ptr->setLinkage(llvm::GlobalValue::InternalLinkage);
+    bf_ptr->setInitializer(ConstantArray::get(tmp_ty, successor_ids));
+
+    // real array
+    global_name = name_prefix + std::to_string(cur_id);
+    tmp_ty = ArrayType::get(Int32Ty, num_successors);
+    M.getOrInsertGlobal(global_name, tmp_ty);
+    auto bf_tmp = M.getNamedGlobal(global_name);
+    // avoid name collisions
+    bf_tmp->setLinkage(llvm::GlobalValue::InternalLinkage);
+    std::vector<Constant*> tmp(num_successors, ConstantInt::get(Int32Ty, 0));
+    bf_tmp->setInitializer(ConstantArray::get(tmp_ty, tmp));
+    bf = bf_tmp;
+
+    return bf_ptr;
+  } else {
+    bf = ConstantPointerNull::get((PointerType*)Int32PtrTy);
+    return ConstantPointerNull::get((PointerType*)Int32PtrPtrTy);
+  }
+}
+
+bool ModuleSanitizerCoverageAFL::hookCmps(Module &M) {
+
+  std::vector<Instruction *> icomps;
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c1 = M.getOrInsertFunction("__patalog_ins_hook1", VoidTy, Int8Ty, Int8Ty,
+                                 Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns1 = c1;
+#else
+  Function *patalogHookIns1 = cast<Function>(c1);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c2 = M.getOrInsertFunction("__patalog_ins_hook2", VoidTy, Int16Ty, Int16Ty,
+                                 Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns2 = c2;
+#else
+  Function *patalogHookIns2 = cast<Function>(c2);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c4 = M.getOrInsertFunction("__patalog_ins_hook4", VoidTy, Int32Ty, Int32Ty,
+                                 Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns4 = c4;
+#else
+  Function *patalogHookIns4 = cast<Function>(c4);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c8 = M.getOrInsertFunction("__patalog_ins_hook8", VoidTy, Int64Ty, Int64Ty,
+                                 Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns8 = c8;
+#else
+  Function *patalogHookIns8 = cast<Function>(c8);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c16 = M.getOrInsertFunction("__patalog_ins_hook16", VoidTy, Int128Ty,
+                                  Int128Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                  ,
+                                  NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR < 9
+  Function *patalogHookIns16 = cast<Function>(c16);
+#else
+  FunctionCallee patalogHookIns16 = c16;
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      cN = M.getOrInsertFunction("__patalog_ins_hookN", VoidTy, Int128Ty,
+                                 Int128Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookInsN = cN;
+#else
+  Function *patalogHookInsN = cast<Function>(cN);
+#endif
+
+  /* iterate over all functions, bbs and instruction and add suitable calls */
+  for (auto &F : M) {
+
+    if (!isInInstrumentList(&F, MNAME)) continue;
+
+    for (auto &BB : F) {
+
+      for (auto &IN : BB) {
+
+        CmpInst *selectcmpInst = nullptr;
+        if ((selectcmpInst = dyn_cast<CmpInst>(&IN))) {
+
+          icomps.push_back(selectcmpInst);
+
+        }
+
+      }
+
+    }
+
+  }
+
+  if (icomps.size()) {
+
+    // if (!be_quiet) errs() << "Hooking " << icomps.size() <<
+    //                          " cmp instructions\n";
+
+    for (auto &selectcmpInst : icomps) {
+
+      IRBuilder<> IRB(selectcmpInst);
+
+      Value *op0 = selectcmpInst->getOperand(0);
+      Value *op1 = selectcmpInst->getOperand(1);
+      Value *op0_saved = op0, *op1_saved = op1;
+      auto   ty0 = op0->getType();
+      auto   ty1 = op1->getType();
+
+      IntegerType *intTyOp0 = NULL;
+      IntegerType *intTyOp1 = NULL;
+      unsigned     max_size = 0, cast_size = 0;
+      unsigned     vector_cnt = 0, is_fp = 0;
+      CmpInst     *cmpInst = dyn_cast<CmpInst>(selectcmpInst);
+
+      if (!cmpInst) { continue; }
+
+      if (selectcmpInst->getOpcode() == Instruction::FCmp) {
+
+        if (ty0->isVectorTy()) {
+
+          VectorType *tt = dyn_cast<VectorType>(ty0);
+          if (!tt) {
+
+            fprintf(stderr, "Warning: patalog cmp vector is not a vector!\n");
+            continue;
+
+          }
+
+#if (LLVM_VERSION_MAJOR >= 12)
+          vector_cnt = tt->getElementCount().getKnownMinValue();
+          ty0 = tt->getElementType();
+#endif
+
+        }
+
+        if (ty0->isHalfTy()
+#if LLVM_VERSION_MAJOR >= 11
+            || ty0->isBFloatTy()
+#endif
+        )
+          max_size = 16;
+        else if (ty0->isFloatTy())
+          max_size = 32;
+        else if (ty0->isDoubleTy())
+          max_size = 64;
+        else if (ty0->isX86_FP80Ty())
+          max_size = 80;
+        else if (ty0->isFP128Ty() || ty0->isPPC_FP128Ty())
+          max_size = 128;
+#if (LLVM_VERSION_MAJOR >= 12)
+        else if (ty0->getTypeID() != llvm::Type::PointerTyID && !be_quiet)
+          fprintf(stderr, "Warning: unsupported cmp type for patalog: %u!\n",
+                  ty0->getTypeID());
+#endif
+
+        is_fp = 1;
+        // fprintf(stderr, "HAVE FP %u!\n", vector_cnt);
+
+      } else {
+
+        if (ty0->isVectorTy()) {
+
+#if (LLVM_VERSION_MAJOR >= 12)
+          VectorType *tt = dyn_cast<VectorType>(ty0);
+          if (!tt) {
+
+            fprintf(stderr, "Warning: patalog cmp vector is not a vector!\n");
+            continue;
+
+          }
+
+          vector_cnt = tt->getElementCount().getKnownMinValue();
+          ty1 = ty0 = tt->getElementType();
+#endif
+
+        }
+
+        intTyOp0 = dyn_cast<IntegerType>(ty0);
+        intTyOp1 = dyn_cast<IntegerType>(ty1);
+
+        if (intTyOp0 && intTyOp1) {
+
+          max_size = intTyOp0->getBitWidth() > intTyOp1->getBitWidth()
+                         ? intTyOp0->getBitWidth()
+                         : intTyOp1->getBitWidth();
+
+        } else {
+
+#if (LLVM_VERSION_MAJOR >= 12)
+          if (ty0->getTypeID() != llvm::Type::PointerTyID && !be_quiet) {
+
+            fprintf(stderr, "Warning: unsupported cmp type for patalog: %u\n",
+                    ty0->getTypeID());
+
+          }
+
+#endif
+
+        }
+
+      }
+
+      if (!max_size || max_size < 16) {
+
+        // fprintf(stderr, "too small\n");
+        continue;
+
+      }
+
+      if (max_size % 8) { max_size = (((max_size / 8) + 1) * 8); }
+
+      if (max_size > 128) {
+
+        if (!be_quiet) {
+
+          fprintf(stderr,
+                  "Cannot handle this compare bit size: %u (truncating)\n",
+                  max_size);
+
+        }
+
+        max_size = 128;
+
+      }
+
+      // do we need to cast?
+      switch (max_size) {
+
+        case 8:
+        case 16:
+        case 32:
+        case 64:
+        case 128:
+          cast_size = max_size;
+          break;
+        default:
+          cast_size = 128;
+
+      }
+
+      // XXX FIXME BUG TODO
+      if (is_fp && vector_cnt) { continue; }
+
+      uint64_t cur = 0, last_val0 = 0, last_val1 = 0, cur_val;
+
+      while (1) {
+
+        std::vector<Value *> args;
+        bool                 skip = false;
+        uint8_t misc = 0;
+        uint8_t predicate = cmpInst->getPredicate();
+
+        if (vector_cnt) {
+
+          op0 = IRB.CreateExtractElement(op0_saved, cur);
+          op1 = IRB.CreateExtractElement(op1_saved, cur);
+          /*
+          std::string errMsg;
+          raw_string_ostream os(errMsg);
+          op0_saved->print(os);
+          fprintf(stderr, "X: %s\n", os.str().c_str());
+          */
+          if (is_fp) {
+
+            /*
+                        ConstantFP *i0 = dyn_cast<ConstantFP>(op0);
+                        ConstantFP *i1 = dyn_cast<ConstantFP>(op1);
+                        // BUG FIXME TODO: this is null ... but why?
+                        // fprintf(stderr, "%p %p\n", i0, i1);
+                        if (i0) {
+
+                          cur_val = (uint64_t)i0->getValue().convertToDouble();
+                          if (last_val0 && last_val0 == cur_val) { skip = true;
+
+               } last_val0 = cur_val;
+
+                        }
+
+                        if (i1) {
+
+                          cur_val = (uint64_t)i1->getValue().convertToDouble();
+                          if (last_val1 && last_val1 == cur_val) { skip = true;
+
+               } last_val1 = cur_val;
+
+                        }
+
+            */
+            ConstantFP *i0 = dyn_cast<ConstantFP>(op0);
+            ConstantFP *i1 = dyn_cast<ConstantFP>(op1);
+            if (i0) {
+              misc |= 1;
+            }
+
+            if (i1) {
+              misc |= 2;
+            }
+
+          } else {
+
+            ConstantInt *i0 = dyn_cast<ConstantInt>(op0);
+            ConstantInt *i1 = dyn_cast<ConstantInt>(op1);
+            if (i0 && i0->uge(0xffffffffffffffff) == false) {
+
+              cur_val = i0->getZExtValue();
+              if (last_val0 && last_val0 == cur_val) { skip = true; }
+              last_val0 = cur_val;
+              // lhs is constant
+              misc |= 1;
+
+            }
+
+            if (i1 && i1->uge(0xffffffffffffffff) == false) {
+
+              cur_val = i1->getZExtValue();
+              if (last_val1 && last_val1 == cur_val) { skip = true; }
+              last_val1 = cur_val;
+              // rhs is constant
+              misc |= 2;
+            }
+
+          }
+
+        } else {
+          if (!is_fp) {
+            ConstantInt *i0 = dyn_cast<ConstantInt>(op0);
+            ConstantInt *i1 = dyn_cast<ConstantInt>(op1);
+            if (i0 && i0->uge(0xffffffffffffffff) == false) {
+              // lhs is constant
+              misc |= 1;
+            }
+
+            if (i1 && i1->uge(0xffffffffffffffff) == false) {
+              // rhs is constant
+              misc |= 2;
+            }
+          } else {
+            ConstantFP *i0 = dyn_cast<ConstantFP>(op0);
+            ConstantFP *i1 = dyn_cast<ConstantFP>(op1);
+            if (i0) {
+              misc |= 1;
+            }
+
+            if (i1) {
+              misc |= 2;
+            }
+          }
+        }
+
+        if (!skip) {
+
+          // errs() << "[PATALOG] cmp  " << *cmpInst << "(in function " <<
+          // cmpInst->getFunction()->getName() << ")\n";
+
+          // first bitcast to integer type of the same bitsize as the original
+          // type (this is a nop, if already integer)
+          Value *op0_i = IRB.CreateBitCast(
+              op0, IntegerType::get(*C, ty0->getPrimitiveSizeInBits()));
+          // then create a int cast, which does zext, trunc or bitcast. In our
+          // case usually zext to the next larger supported type (this is a nop
+          // if already the right type)
+          Value *V0 =
+              IRB.CreateIntCast(op0_i, IntegerType::get(*C, cast_size), false);
+          args.push_back(V0);
+          Value *op1_i = IRB.CreateBitCast(
+              op1, IntegerType::get(*C, ty1->getPrimitiveSizeInBits()));
+          Value *V1 =
+              IRB.CreateIntCast(op1_i, IntegerType::get(*C, cast_size), false);
+          args.push_back(V1);
+
+          // errs() << "[PATALOG] casted parameters:\n0: " << *V0 << "\n1: " <<
+          // *V1
+          // << "\n";
+
+          uint32_t cur_id = (uint32_t)-1;
+          bool redundant = false;
+          Value *constraint_var = vector_cnt > 0 ? op0 : selectcmpInst;
+          if (value_to_type.find(op0) != value_to_type.end() &&
+              value_to_type[op0] == PATA_KIND_CALL) {
+            errs() << "CMP LHS coming from PATA call, skipped: ";
+            constraint_var->print(errs());
+            Instruction *this_insn = dyn_cast<Instruction>(constraint_var);
+            if (this_insn && this_insn->hasMetadata(LLVMContext::MD_dbg)) {
+              errs() << ", at ";
+              this_insn->getDebugLoc().print(errs());
+            }
+            errs() << "\n";
+            redundant = true;
+          } else {
+            auto map_it = value_to_type.find(constraint_var);
+            if (map_it != value_to_type.end()) {
+              errs() << "CMP already instrumented, skipped: ";
+              constraint_var->print(errs());
+              Instruction *this_insn = dyn_cast<Instruction>(constraint_var);
+              if (this_insn && this_insn->hasMetadata(LLVMContext::MD_dbg)) {
+                errs() << ", at ";
+                this_insn->getDebugLoc().print(errs());
+              }
+              errs() << "\n";
+              redundant = true;
+            } else {
+              // new one
+              cur_id = pata_global_id;
+              value_to_type[constraint_var] = PATA_KIND_CMP;
+              ++pata_global_id;
+            }
+          }
+
+          if (!redundant) {
+            args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+                Int32Ty, SanCovPataGuardSectionName)));
+            uint32_t real_size;
+            switch (cast_size) {
+              case 8:
+                IRB.CreateCall(patalogHookIns1, args);
+                real_size = 1;
+                break;
+              case 16:
+                IRB.CreateCall(patalogHookIns2, args);
+                real_size = 2;
+                break;
+              case 32:
+                IRB.CreateCall(patalogHookIns4, args);
+                real_size = 4;
+                break;
+              case 64:
+                IRB.CreateCall(patalogHookIns8, args);
+                real_size = 8;
+                break;
+              case 128:
+                if (max_size == 128) {
+
+                  IRB.CreateCall(patalogHookIns16, args);
+                  real_size = 16;
+
+                } else {
+
+                  IRB.CreateCall(patalogHookInsN, args);
+                  real_size = (max_size / 8) - 1;
+
+                }
+
+                break;
+
+            }
+
+            // TODO: collect block features
+            u32 num_succ;
+            Constant *bf;
+            Constant *bf_ptr = collectBlockFeatures(
+                M, *selectcmpInst, cur_id,
+                "__afl_pata_cmp_bf_ptr_", "__afl_pata_cmp_bf_", num_succ, bf);
+            ModulePataMetadata = CreateModuleDataInSection(
+                PataMetadataTy, SanCovPataMetadataSectionName);
+            ModulePataMetadata->setInitializer(
+              ConstantStruct::get(PataMetadataTy, {
+                ConstantPointerNull::get(voidPtrTy),
+                bf,
+                ConstantInt::get(Int32Ty, num_succ),
+                ConstantInt::get(Int8Ty, PATA_KIND_CMP),
+                ConstantInt::get(Int8Ty, predicate),
+                ConstantInt::get(Int8Ty, real_size),
+                ConstantInt::get(Int8Ty, misc)
+              }));
+            ModulePataMetadata->setAlignment(MaybeAlign(4));
+            ModulePataMetadataPtr = CreateModuleDataInSection(
+                Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+            ModulePataMetadataPtr->setInitializer(bf_ptr);
+            // pata_metadata.push_back(ModulePataMetadata);
+          }
+        }
+
+        /* else fprintf(stderr, "skipped\n"); */
+
+        ++cur;
+        if (cur >= vector_cnt) { break; }
+
+      }
+
+    }
+
+  }
+
+  if (icomps.size())
+    return true;
+  else
+    return false;
+
+}
+
+bool ModuleSanitizerCoverageAFL::hookSwitches(Module &M) {
+
+  std::vector<SwitchInst *> switches;
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c1 = M.getOrInsertFunction("__patalog_switch_hook1", VoidTy, Int8Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns1 = c1;
+#else
+  Function *patalogHookIns1 = cast<Function>(c1);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c2 = M.getOrInsertFunction("__patalog_switch_hook2", VoidTy, Int16Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns2 = c2;
+#else
+  Function *patalogHookIns2 = cast<Function>(c2);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c4 = M.getOrInsertFunction("__patalog_switch_hook4", VoidTy, Int32Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns4 = c4;
+#else
+  Function *patalogHookIns4 = cast<Function>(c4);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c8 = M.getOrInsertFunction("__patalog_switch_hook8", VoidTy, Int64Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookIns8 = c8;
+#else
+  Function *patalogHookIns8 = cast<Function>(c8);
+#endif
+
+  /* iterate over all functions, bbs and instruction and add suitable calls */
+  for (auto &F : M) {
+
+    if (!isInInstrumentList(&F, MNAME)) continue;
+
+    for (auto &BB : F) {
+
+      SwitchInst *switchInst = nullptr;
+      if ((switchInst = dyn_cast<SwitchInst>(BB.getTerminator()))) {
+
+        if (switchInst->getNumCases() > 1) { switches.push_back(switchInst); }
+
+      }
+
+    }
+
+  }
+
+  // unique the collected switches
+  switches.erase(Unique(switches.begin(), switches.end()), switches.end());
+
+  // Instrument switch values for patalog
+  if (switches.size()) {
+
+    if (!be_quiet)
+      errs() << "Hooking " << switches.size() << " switch instructions\n";
+
+    for (auto &SI : switches) {
+
+      Value        *Val = SI->getCondition();
+      unsigned int  max_size = Val->getType()->getIntegerBitWidth(), cast_size;
+      unsigned char do_cast = 0;
+
+      if (!SI->getNumCases() || max_size < 16) {
+
+        // if (!be_quiet) errs() << "skip trivial switch..\n";
+        continue;
+
+      }
+
+      if (max_size % 8) {
+
+        max_size = (((max_size / 8) + 1) * 8);
+        do_cast = 1;
+
+      }
+
+      IRBuilder<> IRB(SI);
+
+      if (max_size > 128) {
+
+        if (!be_quiet) {
+
+          fprintf(stderr,
+                  "Cannot handle this switch bit size: %u (truncating)\n",
+                  max_size);
+
+        }
+
+        max_size = 128;
+        do_cast = 1;
+
+      }
+
+      // do we need to cast?
+      switch (max_size) {
+
+        case 8:
+        case 16:
+        case 32:
+        case 64:
+        case 128:
+          cast_size = max_size;
+          break;
+        default:
+          cast_size = 128;
+          do_cast = 1;
+
+      }
+
+      Value *CompareTo = Val;
+
+      if (do_cast) {
+
+        CompareTo =
+            IRB.CreateIntCast(CompareTo, IntegerType::get(*C, cast_size), false);
+
+      }
+
+      std::vector<Constant*> cases;
+
+      for (SwitchInst::CaseIt i = SI->case_begin(), e = SI->case_end(); i != e;
+           ++i) {
+
+#if LLVM_VERSION_MAJOR < 5
+        ConstantInt *cint = i.getCaseValue();
+#else
+        ConstantInt *cint = i->getCaseValue();
+#endif
+
+        if (cint) {
+
+          std::vector<Value *> args;
+          args.push_back(CompareTo);
+
+          cases.push_back(cint);
+
+//             args.push_back(new_param);
+//             ConstantInt *attribute = ConstantInt::get(Int8Ty, 1);
+//             args.push_back(attribute);
+//             if (cast_size != max_size) {
+
+//               ConstantInt *bitsize =
+//                   ConstantInt::get(Int8Ty, (max_size / 8) - 1);
+//               args.push_back(bitsize);
+
+//             }
+
+//             switch (cast_size) {
+
+//               case 8:
+//                 IRB.CreateCall(patalogHookIns1, args);
+//                 break;
+//               case 16:
+//                 IRB.CreateCall(patalogHookIns2, args);
+//                 break;
+//               case 32:
+//                 IRB.CreateCall(patalogHookIns4, args);
+//                 break;
+//               case 64:
+//                 IRB.CreateCall(patalogHookIns8, args);
+//                 break;
+//               case 128:
+// #ifdef WORD_SIZE_64
+//                 if (max_size == 128) {
+
+//                   IRB.CreateCall(patalogHookIns16, args);
+
+//                 } else {
+
+//                   IRB.CreateCall(patalogHookInsN, args);
+
+//                 }
+
+// #endif
+//                 break;
+//               default:
+//                 break;
+
+//             }
+
+
+        }
+
+      }
+
+      uint32_t num_cases = cases.size();
+      if (num_cases > 0xFFFF) {
+          errs() << "Too many cases (" << num_cases <<  ") in a switch: ";
+          SI->print(errs());
+          errs() << "\n";
+          num_cases = 0;
+      }
+      if (num_cases) {
+        bool redundant = false;
+        uint32_t cur_id = (uint32_t)-1;
+        if (value_to_type.find(CompareTo) != value_to_type.end() &&
+          value_to_type[CompareTo] == PATA_KIND_CALL) {
+          errs() << "SWITCH value coming from PATA call, skipped: ";
+          SI->print(errs());
+          Instruction *this_insn = dyn_cast<Instruction>(SI);
+          if (this_insn && this_insn->hasMetadata(LLVMContext::MD_dbg)) {
+            errs() << ", at ";
+            this_insn->getDebugLoc().print(errs());
+          }
+          errs() << "\n";
+          redundant = true;
+        } else {
+          auto map_it = value_to_type.find(SI);
+          if (map_it != value_to_type.end()) {
+            errs() << "SWITCH already instrumented, skipped: ";
+            SI->print(errs());
+            Instruction *this_insn = dyn_cast<Instruction>(SI);
+            if (this_insn && this_insn->hasMetadata(LLVMContext::MD_dbg)) {
+              errs() << ", at ";
+              this_insn->getDebugLoc().print(errs());
+            }
+            errs() << "\n";
+            redundant = true;
+          } else {
+            // new one
+            cur_id = pata_global_id;
+            value_to_type[SI] = PATA_KIND_SWITCH;
+            ++pata_global_id;
+          }
+        }
+
+        if (!redundant) {
+          std::vector<Value *> args;
+          args.push_back(CompareTo);
+          args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+              Int32Ty, SanCovPataGuardSectionName)));
+
+          bool created = false;
+          uint32_t real_size;
+          Type *real_type;
+
+          switch (cast_size) {
+            case 8:
+              IRB.CreateCall(patalogHookIns1, args);
+              created = true;
+              real_size = 1;
+              real_type = Int8Ty;
+              break;
+            case 16:
+              IRB.CreateCall(patalogHookIns2, args);
+              created = true;
+              real_size = 2;
+              real_type = Int16Ty;
+              break;
+            case 32:
+              IRB.CreateCall(patalogHookIns4, args);
+              created = true;
+              real_size = 4;
+              real_type = Int32Ty;
+              break;
+            case 64:
+              IRB.CreateCall(patalogHookIns8, args);
+              created = true;
+              real_size = 8;
+              real_type = Int64Ty;
+              break;
+            default:
+              FATAL("should not happen");
+              break;
+          }
+
+          if (created) {
+            auto global_name = "__afl_pata_switch_metadata_" + std::to_string(cur_id);
+            auto tmp_ty = ArrayType::get(real_type, num_cases);
+            M.getOrInsertGlobal(global_name, tmp_ty);
+            auto cases_metadata = M.getNamedGlobal(global_name);
+
+            cases_metadata->setInitializer(ConstantArray::get(tmp_ty, cases));
+            // avoid name collision
+            cases_metadata->setLinkage(llvm::GlobalValue::InternalLinkage);
+
+            uint8_t size_lsb = num_cases & 0xFF;
+            uint8_t size_msb = (num_cases >> 8) & 0xFF;
+
+            // TODO: collect block features
+            u32 num_succ;
+            Constant *bf;
+            Constant *bf_ptr = collectBlockFeatures(
+                M, *SI, cur_id,
+                "__afl_pata_switch_bf_ptr_", "__afl_pata_switch_bf_",
+                num_succ, bf);
+            ModulePataMetadata = CreateModuleDataInSection(
+                PataMetadataTy, SanCovPataMetadataSectionName);
+            ModulePataMetadata->setInitializer(
+              ConstantStruct::get(PataMetadataTy, {
+                cases_metadata,
+                bf,
+                ConstantInt::get(Int32Ty, num_succ),
+                ConstantInt::get(Int8Ty, PATA_KIND_SWITCH),
+                ConstantInt::get(Int8Ty, size_lsb),
+                ConstantInt::get(Int8Ty, real_size),
+                ConstantInt::get(Int8Ty, size_msb),
+              }));
+            ModulePataMetadata->setAlignment(MaybeAlign(4));
+            ModulePataMetadataPtr = CreateModuleDataInSection(
+              Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+            ModulePataMetadataPtr->setInitializer(bf_ptr);
+          }
+        }
+      }
+
+    }
+
+  }
+
+  if (switches.size())
+    return true;
+  else
+    return false;
+
+}
+
+bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
+
+  std::vector<CallInst *> Memcmp, Strcmp, Strncmp, Strstr, Memmem;
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c = M.getOrInsertFunction("__patalog_memcmp_hook", VoidTy, Int8PtrTy,
+                                 Int8PtrTy, Int64Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookMemcmp = c;
+#else
+  Function *patalogHookMemcmp = cast<Function>(c);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c1 = M.getOrInsertFunction("__patalog_strncmp_hook", VoidTy, Int8PtrTy,
+                                 Int8PtrTy, Int64Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookStrncmp = c1;
+#else
+  Function *patalogHookStrncmp = cast<Function>(c1);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c2 = M.getOrInsertFunction("__patalog_strcmp_hook", VoidTy, Int8PtrTy,
+                                 Int8PtrTy, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookStrcmp = c2;
+#else
+  Function *patalogHookStrcmp = cast<Function>(c2);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c3 = M.getOrInsertFunction("__patalog_memmem_hook", VoidTy, Int8PtrTy,
+                                 Int64Ty, Int8PtrTy, Int64Ty, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookMemmem = c3;
+#else
+  Function *patalogHookMemmem = cast<Function>(c3);
+#endif
+
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee
+#else
+  Constant *
+#endif
+      c4 = M.getOrInsertFunction("__patalog_strstr_hook", VoidTy, Int8PtrTy,
+                                 Int8PtrTy, Int32Ty
+#if LLVM_VERSION_MAJOR < 5
+                                 ,
+                                 NULL
+#endif
+      );
+#if LLVM_VERSION_MAJOR >= 9
+  FunctionCallee patalogHookStrstr = c4;
+#else
+  Function *patalogHookStrstr = cast<Function>(c4);
+#endif
+
+  /* iterate over all functions, bbs and instruction and add suitable calls */
+  for (auto &F : M) {
+
+    if (!isInInstrumentList(&F, MNAME)) continue;
+
+    for (auto &BB : F) {
+
+      for (auto &IN : BB) {
+
+        CallInst *callInst = nullptr;
+
+        if ((callInst = dyn_cast<CallInst>(&IN))) {
+
+          Function *Callee = callInst->getCalledFunction();
+          if (!Callee) continue;
+          if (callInst->getCallingConv() != llvm::CallingConv::C) continue;
+
+          FunctionType *FT = Callee->getFunctionType();
+          std::string   FuncName = Callee->getName().str();
+
+          bool isPtrRtn = FT->getNumParams() >= 2 &&
+                          !FT->getReturnType()->isVoidTy() &&
+                          FT->getParamType(0) == FT->getParamType(1) &&
+                          FT->getParamType(0)->isPointerTy();
+
+          bool isPtrRtnN = FT->getNumParams() >= 3 &&
+                           !FT->getReturnType()->isVoidTy() &&
+                           FT->getParamType(0) == FT->getParamType(1) &&
+                           FT->getParamType(0)->isPointerTy() &&
+                           FT->getParamType(2)->isIntegerTy();
+          if (isPtrRtnN) {
+
+            auto intTyOp =
+                dyn_cast<IntegerType>(callInst->getArgOperand(2)->getType());
+            if (intTyOp) {
+
+              if (intTyOp->getBitWidth() != 32 &&
+                  intTyOp->getBitWidth() != 64) {
+
+                isPtrRtnN = false;
+
+              }
+
+            }
+
+          }
+
+          bool isMemcmp =
+              (!FuncName.compare("memcmp") || !FuncName.compare("bcmp"));
+          isMemcmp &= FT->getNumParams() == 3 &&
+                      FT->getReturnType()->isIntegerTy(32) &&
+                      FT->getParamType(0)->isPointerTy() &&
+                      FT->getParamType(1)->isPointerTy() &&
+                      FT->getParamType(2)->isIntegerTy();
+
+          bool isStrcmp =
+              (!FuncName.compare("strcmp") || !FuncName.compare("strcasecmp"));
+          isStrcmp &=
+              FT->getNumParams() == 2 && FT->getReturnType()->isIntegerTy(32) &&
+              FT->getParamType(0) == FT->getParamType(1) &&
+              FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
+
+          bool isStrstr = 
+            (!FuncName.compare("strstr") || !FuncName.compare("strcasestr"));
+          isStrstr &=
+              FT->getNumParams() == 2 && FT->getReturnType()->isPointerTy() &&
+              FT->getParamType(0) == FT->getParamType(1) &&
+              FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
+          
+          bool isStrncmp = (!FuncName.compare("strncmp") ||
+                            !FuncName.compare("strncasecmp"));
+          isStrncmp &= FT->getNumParams() == 3 &&
+                       FT->getReturnType()->isIntegerTy(32) &&
+                       FT->getParamType(0) == FT->getParamType(1) &&
+                       FT->getParamType(0) ==
+                           IntegerType::getInt8PtrTy(M.getContext()) &&
+                       FT->getParamType(2)->isIntegerTy();
+          
+          bool isMemmem = !FuncName.compare("memmem");
+          isMemmem &= FT->getNumParams() == 4 &&
+                      FT->getReturnType()->isPointerTy() &&
+                      FT->getParamType(0) == FT->getParamType(2) &&
+                      FT->getParamType(1) == FT->getParamType(3) &&
+                      FT->getParamType(0)->isPointerTy() &&
+                      FT->getParamType(2)->isIntegerTy();
+
+          /*
+                    {
+
+                       fprintf(stderr, "F:%s C:%s argc:%u\n",
+                       F.getName().str().c_str(),
+             Callee->getName().str().c_str(), FT->getNumParams());
+                       fprintf(stderr, "ptr0:%u ptr1:%u ptr2:%u\n",
+                              FT->getParamType(0)->isPointerTy(),
+                              FT->getParamType(1)->isPointerTy(),
+                              FT->getNumParams() > 2 ?
+             FT->getParamType(2)->isPointerTy() : 22 );
+
+                    }
+
+          */
+
+          if (isMemcmp || isStrcmp || isStrncmp || isStrstr || isMemmem) {
+
+            isPtrRtnN = isPtrRtn = false;
+
+          }
+
+
+          if (isMemcmp) { Memcmp.push_back(callInst); }
+          if (isStrcmp) { Strcmp.push_back(callInst); }
+          if (isStrncmp) { Strncmp.push_back(callInst); }
+          if (isStrstr) { Strstr.push_back(callInst); }
+          if (isMemmem) { Memmem.push_back(callInst); }
+
+        }
+
+      }
+
+    }
+
+  }
+
+  if (!Memcmp.size() && !Strcmp.size() &&
+      !Strncmp.size() && !Strstr.size() && !Memmem.size())
+    return false;
+
+  /*
+    if (!be_quiet)
+      errs() << "Hooking " << calls.size()
+             << " calls with pointers as arguments\n";
+  */
+
+  u32 num_succ;
+  Constant *bf;
+  Constant *bf_ptr;
+  for (auto &callInst : Memcmp) {
+
+    Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1),
+          *v3P = callInst->getArgOperand(2);
+
+    IRBuilder<> IRB(callInst);
+
+    uint32_t cur_id = (uint32_t)-1;
+    bool redundant = false;
+    auto map_it = value_to_type.find(callInst);
+    if (map_it != value_to_type.end()) {
+      errs() << "CALL already instrumented, skipped: ";
+      callInst->print(errs());
+      errs() << "\n";
+      redundant = true;
+    } else {
+      // new one
+      cur_id = pata_global_id;
+      value_to_type[callInst] = PATA_KIND_CALL;
+      ++pata_global_id;
+    }
+    
+    if (!redundant) {
+      std::vector<Value *> args;
+      Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
+      Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
+      Value               *v3Pbitcast = IRB.CreateBitCast(
+                        v3P, IntegerType::get(*C, v3P->getType()->getPrimitiveSizeInBits()));
+      Value *v3Pcasted =
+          IRB.CreateIntCast(v3Pbitcast, IntegerType::get(*C, 64), false);
+      args.push_back(v1Pcasted);
+      args.push_back(v2Pcasted);
+      args.push_back(v3Pcasted);
+      args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+          Int32Ty, SanCovPataGuardSectionName)));
+
+      IRB.CreateCall(patalogHookMemcmp, args);
+
+      bf_ptr = collectBlockFeatures(
+          M, *callInst, cur_id,
+          "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
+      ModulePataMetadata = CreateModuleDataInSection(
+          PataMetadataTy, SanCovPataMetadataSectionName);
+      ModulePataMetadata->setInitializer(
+        ConstantStruct::get(PataMetadataTy, {
+          ConstantPointerNull::get(voidPtrTy),
+          bf,
+          ConstantInt::get(Int32Ty, num_succ),
+          ConstantInt::get(Int8Ty, PATA_KIND_CALL),
+          ConstantInt::get(Int8Ty, PATA_CALL_MEMCMP),
+          ConstantInt::get(Int8Ty, 0),
+          ConstantInt::get(Int8Ty, 0),
+        }));
+      ModulePataMetadata->setAlignment(MaybeAlign(4));
+      ModulePataMetadataPtr = CreateModuleDataInSection(
+          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+      ModulePataMetadataPtr->setInitializer(bf_ptr);
+    }
+
+    // errs() << callInst->getCalledFunction()->getName() << "\n";
+
+  }
+
+  for (auto &callInst : Strcmp) {
+
+    Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1);
+
+    IRBuilder<> IRB(callInst);
+
+    uint32_t cur_id = (uint32_t)-1;
+    bool redundant = false;
+    auto map_it = value_to_type.find(callInst);
+    if (map_it != value_to_type.end()) {
+      errs() << "CALL already instrumented, skipped: ";
+      callInst->print(errs());
+      errs() << "\n";
+      redundant = true;
+    } else {
+      // new one
+      cur_id = pata_global_id;
+      value_to_type[callInst] = PATA_KIND_CALL;
+      ++pata_global_id;
+    }
+
+    if (!redundant) {
+      std::vector<Value *> args;
+      Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
+      Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
+      args.push_back(v1Pcasted);
+      args.push_back(v2Pcasted);
+      args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+          Int32Ty, SanCovPataGuardSectionName)));
+
+      IRB.CreateCall(patalogHookStrcmp, args);
+
+      bf_ptr = collectBlockFeatures(
+          M, *callInst, cur_id,
+          "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
+      ModulePataMetadata = CreateModuleDataInSection(
+          PataMetadataTy, SanCovPataMetadataSectionName);
+      ModulePataMetadata->setInitializer(
+        ConstantStruct::get(PataMetadataTy, {
+          ConstantPointerNull::get(voidPtrTy),
+          bf,
+          ConstantInt::get(Int32Ty, num_succ),
+          ConstantInt::get(Int8Ty, PATA_KIND_CALL),
+          ConstantInt::get(Int8Ty, PATA_CALL_STRCMP),
+          ConstantInt::get(Int8Ty, 0),
+          ConstantInt::get(Int8Ty, 0),
+        }));
+      ModulePataMetadata->setAlignment(MaybeAlign(4));
+      ModulePataMetadataPtr = CreateModuleDataInSection(
+          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+      ModulePataMetadataPtr->setInitializer(bf_ptr);
+    }
+
+    // errs() << callInst->getCalledFunction()->getName() << "\n";
+
+  }
+
+  for (auto &callInst : Strncmp) {
+
+    Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1),
+          *v3P = callInst->getArgOperand(2);
+
+    IRBuilder<> IRB(callInst);
+
+    uint32_t cur_id = (uint32_t)-1;
+    bool redundant = false;
+    auto map_it = value_to_type.find(callInst);
+    if (map_it != value_to_type.end()) {
+      errs() << "CALL already instrumented, skipped: ";
+      callInst->print(errs());
+      errs() << "\n";
+      redundant = true;
+    } else {
+      // new one
+      cur_id = pata_global_id;
+      value_to_type[callInst] = PATA_KIND_CALL;
+      ++pata_global_id;
+    }
+
+    if (!redundant) {
+      std::vector<Value *> args;
+      Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
+      Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
+      Value               *v3Pbitcast = IRB.CreateBitCast(
+                        v3P, IntegerType::get(*C, v3P->getType()->getPrimitiveSizeInBits()));
+      Value *v3Pcasted =
+          IRB.CreateIntCast(v3Pbitcast, IntegerType::get(*C, 64), false);
+      args.push_back(v1Pcasted);
+      args.push_back(v2Pcasted);
+      args.push_back(v3Pcasted);
+      args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+          Int32Ty, SanCovPataGuardSectionName)));
+
+      IRB.CreateCall(patalogHookStrncmp, args);
+
+      bf_ptr = collectBlockFeatures(
+          M, *callInst, cur_id,
+          "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
+      ModulePataMetadata = CreateModuleDataInSection(
+          PataMetadataTy, SanCovPataMetadataSectionName);
+      ModulePataMetadata->setInitializer(
+        ConstantStruct::get(PataMetadataTy, {
+          ConstantPointerNull::get(voidPtrTy),
+          bf,
+          ConstantInt::get(Int32Ty, num_succ),
+          ConstantInt::get(Int8Ty, PATA_KIND_CALL),
+          ConstantInt::get(Int8Ty, PATA_CALL_STRNCMP),
+          ConstantInt::get(Int8Ty, 0),
+          ConstantInt::get(Int8Ty, 0),
+        }));
+      ModulePataMetadata->setAlignment(MaybeAlign(4));
+      ModulePataMetadataPtr = CreateModuleDataInSection(
+          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+      ModulePataMetadataPtr->setInitializer(bf_ptr);
+    }
+
+    // errs() << callInst->getCalledFunction()->getName() << "\n";
+
+  }
+
+  for (auto &callInst : Strstr) {
+    Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1);
+
+    IRBuilder<> IRB(callInst);
+
+    uint32_t cur_id = (uint32_t)-1;
+    bool redundant = false;
+    auto map_it = value_to_type.find(callInst);
+    if (map_it != value_to_type.end()) {
+      errs() << "CALL already instrumented, skipped: ";
+      callInst->print(errs());
+      errs() << "\n";
+      redundant = true;
+    } else {
+      // new one
+      cur_id = pata_global_id;
+      value_to_type[callInst] = PATA_KIND_CALL;
+      ++pata_global_id;
+    }
+
+    if (!redundant) {
+      std::vector<Value *> args;
+      Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
+      Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
+      args.push_back(v1Pcasted);
+      args.push_back(v2Pcasted);
+      args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+          Int32Ty, SanCovPataGuardSectionName)));
+
+      IRB.CreateCall(patalogHookStrstr, args);
+
+      bf_ptr = collectBlockFeatures(
+          M, *callInst, cur_id,
+          "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
+      ModulePataMetadata = CreateModuleDataInSection(
+          PataMetadataTy, SanCovPataMetadataSectionName);
+      ModulePataMetadata->setInitializer(
+        ConstantStruct::get(PataMetadataTy, {
+          ConstantPointerNull::get(voidPtrTy),
+          bf,
+          ConstantInt::get(Int32Ty, num_succ),
+          ConstantInt::get(Int8Ty, PATA_KIND_CALL),
+          ConstantInt::get(Int8Ty, PATA_CALL_STRSTR),
+          ConstantInt::get(Int8Ty, 0),
+          ConstantInt::get(Int8Ty, 0),
+        }));
+      ModulePataMetadata->setAlignment(MaybeAlign(4));
+      ModulePataMetadataPtr = CreateModuleDataInSection(
+          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+      ModulePataMetadataPtr->setInitializer(bf_ptr);
+    }
+  }
+
+  for (auto &callInst : Memmem) {
+    Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1),
+          *v3P = callInst->getArgOperand(2), *v4P = callInst->getArgOperand(3);
+
+    IRBuilder<> IRB(callInst);
+
+    uint32_t cur_id = (uint32_t)-1;
+    bool redundant = false;
+    auto map_it = value_to_type.find(callInst);
+    if (map_it != value_to_type.end()) {
+      errs() << "CALL already instrumented, skipped: ";
+      callInst->print(errs());
+      errs() << "\n";
+      redundant = true;
+    } else {
+      // new one
+      cur_id = pata_global_id;
+      value_to_type[callInst] = PATA_KIND_CALL;
+      ++pata_global_id;
+    }
+    
+    if (!redundant) {
+      std::vector<Value *> args;
+      Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
+      Value               *v3Pcasted = IRB.CreatePointerCast(v3P, Int8PtrTy);
+      Value               *v2Pbitcast = IRB.CreateBitCast(
+                        v2P, IntegerType::get(*C, v2P->getType()->getPrimitiveSizeInBits()));
+      Value               *v4Pbitcast = IRB.CreateBitCast(
+                        v4P, IntegerType::get(*C, v4P->getType()->getPrimitiveSizeInBits()));
+      Value *v2Pcasted =
+          IRB.CreateIntCast(v2Pbitcast, IntegerType::get(*C, 64), false);
+      Value *v4Pcasted =
+          IRB.CreateIntCast(v4Pbitcast, IntegerType::get(*C, 64), false);
+      args.push_back(v1Pcasted);
+      args.push_back(v2Pcasted);
+      args.push_back(v3Pcasted);
+      args.push_back(v4Pcasted);
+      args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
+          Int32Ty, SanCovPataGuardSectionName)));
+
+      IRB.CreateCall(patalogHookMemmem, args);
+
+      bf_ptr = collectBlockFeatures(
+          M, *callInst, cur_id,
+          "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
+      ModulePataMetadata = CreateModuleDataInSection(
+          PataMetadataTy, SanCovPataMetadataSectionName);
+      ModulePataMetadata->setInitializer(
+        ConstantStruct::get(PataMetadataTy, {
+          ConstantPointerNull::get(voidPtrTy),
+          bf,
+          ConstantInt::get(Int32Ty, num_succ),
+          ConstantInt::get(Int8Ty, PATA_KIND_CALL),
+          ConstantInt::get(Int8Ty, PATA_CALL_MEMMEM),
+          ConstantInt::get(Int8Ty, 0),
+          ConstantInt::get(Int8Ty, 0),
+        }));
+      ModulePataMetadata->setAlignment(MaybeAlign(4));
+      ModulePataMetadataPtr = CreateModuleDataInSection(
+          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+      ModulePataMetadataPtr->setInitializer(bf_ptr);
+    }
+  }
+
+  return true;
+
+}
+
+void ModuleSanitizerCoverageAFL::initializePataGlobals(Module &M) {
+  Int128Ty = IntegerType::getInt128Ty(*C);
+  voidPtrTy = PointerType::get(VoidTy, 0);
+  Int32PtrPtrTy = PointerType::get(Int32PtrTy, 0);
+  Int32PtrPtrPtrTy = PointerType::get(Int32PtrPtrTy, 0);
+
+  PataMetadataTy = StructType::create(*C);
+  PataMetadataTy->setBody(
+      {voidPtrTy, Int32PtrTy, Int32Ty, Int8Ty, Int8Ty, Int8Ty, Int8Ty}, true);
+  
+  PataMetadataPtrTy = PointerType::get(PataMetadataTy, 0);
+
+  Null = Constant::getNullValue(PointerType::get(Int8Ty, 0));
+}
+/* PATA end */
 
 PreservedAnalyses ModuleSanitizerCoverageAFL::run(Module                &M,
                                                   ModuleAnalysisManager &MAM) {
@@ -382,7 +1934,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   FunctionPCsArray = nullptr;
   IntptrTy = Type::getIntNTy(*C, DL->getPointerSizeInBits());
   IntptrPtrTy = PointerType::getUnqual(IntptrTy);
-  Type       *VoidTy = Type::getVoidTy(*C);
+  VoidTy = Type::getVoidTy(*C);
   IRBuilder<> IRB(*C);
   Int64PtrTy = PointerType::getUnqual(IRB.getInt64Ty());
   Int32PtrTy = PointerType::getUnqual(IRB.getInt32Ty());
@@ -468,8 +2020,23 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   SanCovTracePCGuard =
       M.getOrInsertFunction(SanCovTracePCGuardName, VoidTy, Int32PtrTy);
 
+  /* PATA begin */
+  patalog_mode = 0;
+  if (getenv("AFL_LLVM_PATALOG") || getenv("AFL_PATALOG")) { patalog_mode = 1; }
+  if (patalog_mode) { initializePataGlobals(M); }
+  /* PATA end */
+  
   for (auto &F : M)
     instrumentFunction(F, DTCallback, PDTCallback);
+
+  /* PATA begin */
+  if (patalog_mode) {
+    pata_global_id = 0;
+    hookRtns(M);
+    hookSwitches(M);
+    hookCmps(M);
+  }
+  /* PATA end*/
 
   Function *Ctor = nullptr;
 
@@ -487,6 +2054,20 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
                                       SanCovBoolFlagInitName, Int1PtrTy,
                                       SanCovBoolFlagSectionName);
 
+  }
+
+  if (patalog_mode) {
+    Ctor = CreateInitCallsForSections(M, SanCovModuleCtorPataGuardName,
+                                    SanCovPataGuardInitName, Int32PtrTy,
+                                    SanCovPataGuardSectionName);
+    Ctor = CreateInitCallsForSections(M, SanCovModuleCtorPataMetadataPtrName,
+                                    SanCovPataMetadataPtrInitName,
+                                    Int32PtrPtrPtrTy,
+                                    SanCovPataMetadataPtrSectionName);
+    Ctor = CreateInitCallsForSections(M, SanCovModuleCtorPataMetadataName,
+                                    SanCovPataMetadataInitName,
+                                    PataMetadataPtrTy,
+                                    SanCovPataMetadataSectionName);
   }
 
   if (Ctor && Options.PCTable) {
@@ -744,6 +2325,21 @@ GlobalVariable *ModuleSanitizerCoverageAFL::CreateFunctionLocalArrayInSection(
   return Array;
 
 }
+
+/* PATA start */
+GlobalVariable *ModuleSanitizerCoverageAFL::
+CreateModuleDataInSection(Type *Ty, const char *Section) {
+  auto       Data = new GlobalVariable(
+            *CurModule, Ty, false, GlobalVariable::PrivateLinkage,
+            Constant::getNullValue(Ty), "__sancov_gen_");
+
+  Data->setSection(getSectionName(Section));
+  GlobalsToAppendToUsed.push_back(Data);
+  GlobalsToAppendToCompilerUsed.push_back(Data);
+
+  return Data;
+}
+/* PATA end */
 
 GlobalVariable *ModuleSanitizerCoverageAFL::CreatePCArray(
     Function &F, ArrayRef<BasicBlock *> AllBlocks) {
@@ -1393,6 +2989,14 @@ void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function   &F,
     //    IRB.CreateCall(SanCovTracePCGuard, GuardPtr)->setCannotMerge();
     ++instr;
 
+    /* PATA start */
+    if (patalog_mode) {
+      block_to_id[&BB] = ConstantExpr::getIntToPtr(ConstantExpr::getAdd(
+          ConstantExpr::getPointerCast(FunctionGuardArray, IntptrTy),
+          ConstantInt::get(IntptrTy, Idx * 4)), Int32PtrTy);
+    }
+    /* PATA end */
+
   }
 
   if (Options.Inline8bitCounters) {
@@ -1447,6 +3051,101 @@ void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function   &F,
   }
 
 }
+
+/* PATA start */
+void ModuleSanitizerCoverageAFL::InjectCoverageForPata(Function   &F,
+                                                       BasicBlock &BB) {
+
+  BasicBlock::iterator IP = BB.getFirstInsertionPt();
+  bool                 IsEntryBB = &BB == &F.getEntryBlock();
+
+  if (IsEntryBB) {
+
+    // Keep allocas and llvm.localescape calls in the entry block.  Even
+    // if we aren't splitting the block, it's nice for allocas to be before
+    // calls.
+    IP = PrepareToSplitEntryBlock(BB, IP);
+
+  }
+
+  IRBuilder<> IRB(&*IP);
+
+  if (Options.TracePC) {
+
+    IRB.CreateCall(SanCovTracePC);
+    //        ->setCannotMerge();  // gets the PC using GET_CALLER_PC.
+
+  }
+
+  if (Options.TracePCGuard) {
+
+    /* Get CurLoc */
+
+    PataTmpGuardArray = CreateFunctionLocalArrayInSection(
+        1, F, Int32Ty, SanCovGuardsSectionName);
+
+    Value *GuardPtr = IRB.CreateIntToPtr(
+        IRB.CreateAdd(IRB.CreatePointerCast(PataTmpGuardArray, IntptrTy),
+                      ConstantInt::get(IntptrTy, 0)),
+        Int32PtrTy);
+
+    LoadInst *CurLoc = IRB.CreateLoad(IRB.getInt32Ty(), GuardPtr);
+    ModuleSanitizerCoverageAFL::SetNoSanitizeMetadata(CurLoc);
+
+    /* Load SHM pointer */
+
+    LoadInst *MapPtr = IRB.CreateLoad(PointerType::get(Int8Ty, 0), AFLMapPtr);
+    ModuleSanitizerCoverageAFL::SetNoSanitizeMetadata(MapPtr);
+
+    /* Load counter for CurLoc */
+
+    Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CurLoc);
+
+    if (use_threadsafe_counters) {
+
+      IRB.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::Add, MapPtrIdx, One,
+#if LLVM_VERSION_MAJOR >= 13
+                          llvm::MaybeAlign(1),
+#endif
+                          llvm::AtomicOrdering::Monotonic);
+
+    } else {
+
+      LoadInst *Counter = IRB.CreateLoad(IRB.getInt8Ty(), MapPtrIdx);
+      ModuleSanitizerCoverageAFL::SetNoSanitizeMetadata(Counter);
+
+      /* Update bitmap */
+
+      Value *Incr = IRB.CreateAdd(Counter, One);
+
+      if (skip_nozero == NULL) {
+
+        auto cf = IRB.CreateICmpEQ(Incr, Zero);
+        auto carry = IRB.CreateZExt(cf, Int8Ty);
+        Incr = IRB.CreateAdd(Incr, carry);
+
+      }
+
+      StoreInst *StoreCtx = IRB.CreateStore(Incr, MapPtrIdx);
+      ModuleSanitizerCoverageAFL::SetNoSanitizeMetadata(StoreCtx);
+
+    }
+
+    // done :)
+    block_to_id[&BB] = ConstantExpr::getIntToPtr(
+        ConstantExpr::getAdd(
+            ConstantExpr::getPointerCast(PataTmpGuardArray, IntptrTy),
+            ConstantInt::get(IntptrTy, 0)),
+        Int32PtrTy);
+    
+
+    //    IRB.CreateCall(SanCovTracePCGuard, Offset)->setCannotMerge();
+    //    IRB.CreateCall(SanCovTracePCGuard, GuardPtr)->setCannotMerge();
+    ++instr;
+
+  }
+}
+/* PATA end */
 
 std::string ModuleSanitizerCoverageAFL::getSectionName(
     const std::string &Section) const {

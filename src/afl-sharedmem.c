@@ -36,6 +36,7 @@
 #include "hash.h"
 #include "sharedmem.h"
 #include "cmplog.h"
+#include "patalog.h"
 #include "list.h"
 
 #include <stdio.h>
@@ -127,9 +128,36 @@ void afl_shm_deinit(sharedmem_t *shm) {
 
   }
 
+  if (shm->patalog_mode) {
+
+    unsetenv(PATALOG_SHM_ENV_VAR);
+
+    if (shm->pata_map != NULL) {
+
+      munmap(shm->pata_map, PATALOG_MAP_SIZE);
+      shm->pata_map = NULL;
+
+    }
+
+    if (shm->patalog_g_shm_fd != -1) {
+
+      close(shm->patalog_g_shm_fd);
+      shm->patalog_g_shm_fd = -1;
+
+    }
+
+    if (shm->patalog_g_shm_file_path[0]) {
+
+      shm_unlink(shm->patalog_g_shm_file_path);
+      shm->patalog_g_shm_file_path[0] = 0;
+
+    }
+
+  }
 #else
   shmctl(shm->shm_id, IPC_RMID, NULL);
   if (shm->cmplog_mode) { shmctl(shm->cmplog_shm_id, IPC_RMID, NULL); }
+  if (shm->patalog_mode) { shmctl(shm->patalog_shm_id, IPC_RMID, NULL); }
 #endif
 
   shm->map = NULL;
@@ -147,11 +175,13 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
   shm->map = NULL;
   shm->cmp_map = NULL;
+  shm->pata_map = NULL;
 
 #ifdef USEMMAP
 
   shm->g_shm_fd = -1;
   shm->cmplog_g_shm_fd = -1;
+  shm->patalog_g_shm_fd = -1;
 
   const int shmflags = O_RDWR | O_EXCL;
 
@@ -271,6 +301,49 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
   }
 
+  if (shm->patalog_mode) {
+
+    snprintf(shm->patalog_g_shm_file_path, L_tmpnam, "/afl_patalog_%d_%ld",
+             getpid(), random());
+
+    /* create the shared memory segment as if it was a file */
+    shm->patalog_g_shm_fd =
+        shm_open(shm->patalog_g_shm_file_path, O_CREAT | O_RDWR | O_EXCL,
+                 DEFAULT_PERMISSION);
+    if (shm->patalog_g_shm_fd == -1) { PFATAL("shm_open() failed"); }
+
+    /* configure the size of the shared memory segment */
+    if (ftruncate(shm->patalog_g_shm_fd, PATALOG_MAP_SIZE)) {
+
+      PFATAL("setup_shm(): patalog ftruncate() failed");
+
+    }
+
+    /* map the shared memory segment to the address space of the process */
+    shm->pata_map = mmap(0, PATALOG_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        shm->patalog_g_shm_fd, 0);
+    if (shm->pata_map == MAP_FAILED) {
+
+      close(shm->patalog_g_shm_fd);
+      shm->patalog_g_shm_fd = -1;
+      shm_unlink(shm->patalog_g_shm_file_path);
+      shm->patalog_g_shm_file_path[0] = 0;
+      PFATAL("mmap() failed");
+
+    }
+
+    /* If somebody is asking us to fuzz instrumented binaries in
+       non-instrumented mode, we don't want them to detect instrumentation,
+       since we won't be sending fork server commands. This should be replaced
+       with better auto-detection later on, perhaps? */
+
+    if (!non_instrumented_mode)
+      setenv(PATALOG_SHM_ENV_VAR, shm->patalog_g_shm_file_path, 1);
+
+    if (shm->pata_map == (void *)-1 || !shm->pata_map)
+      PFATAL("patalog mmap() failed");
+
+  }
 #else
   u8 *shm_str;
 
@@ -299,6 +372,15 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
   }
 
+  if (shm->patalog_mode) {
+    shm->patalog_shm_id = shmget(IPC_PRIVATE, PATALOG_MAP_SIZE,
+                                 IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+    if (shm->patalog_shm_id < 0) {
+      shmctl(shm->patalog_shm_id, IPC_RMID, NULL);
+      PFATAL("shmget() failed, try running afl-system-config");
+    }
+  }
+
   if (!non_instrumented_mode) {
 
     shm_str = alloc_printf("%d", shm->shm_id);
@@ -324,6 +406,12 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
   }
 
+  if (shm->patalog_mode && !non_instrumented_mode) {
+    shm_str = alloc_printf("%d", shm->patalog_shm_id);
+    setenv(PATALOG_SHM_ENV_VAR, shm_str, 1);
+    ck_free(shm_str);
+  }
+
   shm->map = shmat(shm->shm_id, NULL, 0);
 
   if (shm->map == (void *)-1 || !shm->map) {
@@ -334,6 +422,10 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
       shmctl(shm->cmplog_shm_id, IPC_RMID, NULL);  // do not leak shmem
 
+    }
+
+    if (shm->patalog_mode) {
+      shmctl(shm->patalog_shm_id, IPC_RMID, NULL);
     }
 
     PFATAL("shmat() failed");
@@ -354,6 +446,18 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
     }
 
+  }
+
+  if (shm->patalog_mode) {
+    shm->pata_map = shmat(shm->patalog_shm_id, NULL, 0);
+
+    if (shm->pata_map == (void *)-1 || !shm->pata_map) {
+      shmctl(shm->shm_id, IPC_RMID, NULL);  // do not leak shmem
+      shmctl(shm->patalog_shm_id, IPC_RMID, NULL);  // do not leak shmem
+      PFATAL("shmat() failed");
+    }
+    ((u32*)shm->pata_map)[1] = PATA_MAP_HEADER;
+    ((u32*)shm->pata_map)[2] = PATA_FILTER_NONE;
   }
 
 #endif

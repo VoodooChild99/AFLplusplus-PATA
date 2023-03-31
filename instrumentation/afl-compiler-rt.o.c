@@ -20,6 +20,7 @@
 #include "config.h"
 #include "types.h"
 #include "cmplog.h"
+#include "patalog.h"
 #include "llvm-alternative-coverage.h"
 
 #define XXH_INLINE_ALL
@@ -125,6 +126,14 @@ __thread u32        __afl_prev_ctx;
 
 struct cmp_map *__afl_cmp_map;
 struct cmp_map *__afl_cmp_map_backup;
+
+///// PataLog instrumentation
+void *__afl_pata_map;
+void *__afl_pata_map_backup;
+// static uint32_t __afl_pata_map_cursor = PATA_MAP_HEADER;
+ConstraintVariable *__afl_pata_metadata;
+uint32_t ***__afl_pata_metadata_ptr;
+u32 __afl_pata_metadata_len;
 
 /* Child pid? */
 
@@ -678,6 +687,69 @@ static void __afl_map_shm(void) {
 
   }
 
+  id_str = getenv(PATALOG_SHM_ENV_VAR);
+
+  if (__afl_debug) {
+    fprintf(stderr, "DEBUG: patalog id_str %s\n",
+            id_str == NULL ? "<null>" : id_str);
+  }
+
+  if (id_str) {
+
+    if ((__afl_dummy_fd[1] = open("/dev/null", O_WRONLY)) < 0) {
+
+      if (pipe(__afl_dummy_fd) < 0) { __afl_dummy_fd[1] = 1; }
+
+    }
+
+#ifdef USEMMAP
+    const char     *shm_file_path = id_str;
+    int             shm_fd = -1;
+    void           *shm_base = NULL;
+
+    /* create the shared memory segment as if it was a file */
+    shm_fd = shm_open(shm_file_path, O_RDWR, DEFAULT_PERMISSION);
+    if (shm_fd == -1) {
+
+      perror("shm_open() failed\n");
+      send_forkserver_error(FS_ERROR_SHM_OPEN);
+      exit(1);
+
+    }
+
+    /* map the shared memory segment to the address space of the process */
+    shm_base = mmap(0, PATALOG_MAP_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, shm_fd, 0);
+    if (shm_base == MAP_FAILED) {
+
+      close(shm_fd);
+      shm_fd = -1;
+
+      fprintf(stderr, "mmap() failed\n");
+      send_forkserver_error(FS_ERROR_SHM_OPEN);
+      exit(2);
+
+    }
+
+    __afl_pata_map = shm_base;
+#else
+    u32 shm_id = atoi(id_str);
+
+    __afl_pata_map = shmat(shm_id, NULL, 0);
+
+#endif
+
+    __afl_pata_map_backup = __afl_pata_map;
+
+    if (!__afl_pata_map || __afl_pata_map == (void *)-1) {
+
+      perror("shmat for patalog");
+      send_forkserver_error(FS_ERROR_SHM_OPEN);
+      _exit(1);
+
+    }
+
+  }
 }
 
 /* unmap SHM. */
@@ -729,6 +801,24 @@ static void __afl_unmap_shm(void) {
 
   }
 
+  id_str = getenv(PATALOG_SHM_ENV_VAR);
+
+  if (id_str) {
+
+#ifdef USEMMAP
+
+    munmap((void *)__afl_pata_map, PATALOG_MAP_SIZE);
+
+#else
+
+    shmdt((void *)__afl_pata_map);
+
+#endif
+
+    __afl_pata_map = NULL;
+    __afl_pata_map_backup = NULL;
+
+  }
   __afl_already_initialized_shm = 0;
 
 }
@@ -781,11 +871,16 @@ static void __afl_start_snapshots(void) {
   if (__afl_map_size <= FS_OPT_MAX_MAPSIZE)
     status |= (FS_OPT_SET_MAPSIZE(__afl_map_size) | FS_OPT_MAPSIZE);
   if (__afl_dictionary_len && __afl_dictionary) { status |= FS_OPT_AUTODICT; }
+  if (__afl_pata_metadata_len) {
+    status |= FS_OPT_PATALOG;
+    status &= (~FS_OPT_AUTODICT);
+  }
   memcpy(tmp, &status, 4);
 
   if (write(FORKSRV_FD + 1, tmp, 4) != 4) { return; }
 
-  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary)) {
+  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary) ||
+      __afl_pata_metadata_len) {
 
     if (read(FORKSRV_FD, &was_killed, 4) != 4) {
 
@@ -840,6 +935,57 @@ static void __afl_start_snapshots(void) {
 
       }
 
+    }
+    
+    if ((was_killed & (FS_OPT_ENABLED | FS_OPT_PATALOG)) ==
+               (FS_OPT_ENABLED | FS_OPT_PATALOG) && __afl_pata_metadata_len) {
+      // great lets pass the dictionary through the forkserver FD
+      u32 len = __afl_pata_metadata_len, offset = 0;
+
+      if (write(FORKSRV_FD + 1, &len, 4) != 4) {
+
+        write(2, "Error: could not send PATA metadata len\n",
+              strlen("Error: could not send PATA metadata len\n"));
+        _exit(1);
+
+      }
+
+      while (len != 0) {
+        s32 ret;
+        ConstraintVariable *cv = __afl_pata_metadata + offset;
+        ret = write(FORKSRV_FD + 1, cv, sizeof(ConstraintVariable));
+
+        if (ret != sizeof(ConstraintVariable)) {
+
+          write(2, "Error: could not send metadata\n",
+                strlen("Error: could not send metadata\n"));
+          _exit(1);
+
+        }
+
+        if (cv->opaque) {
+          assert(cv->kind == PATA_KIND_SWITCH);
+          u32 num_cases = (cv->misc << 8 | cv->operation);
+          u32 data_size = num_cases * cv->size;
+          ret = write(FORKSRV_FD + 1, cv->opaque, data_size);
+          if (ret != data_size) {
+            write(2, "Error: could not send switch metadata\n",
+                strlen("Error: could not send switch metadata\n"));
+            _exit(1);
+          }
+        }
+        if (cv->bf) {
+          u32 data_size = cv->num_bf * sizeof(u32);
+          ret = write(FORKSRV_FD + 1, cv->bf, data_size);
+          if (ret != data_size) {
+            write(2, "Error: could not send block features in metadata\n",
+                strlen("Error: could not send block features in metadata\n"));
+            _exit(1);
+          }
+        }
+        len -= 1;
+        offset += 1;
+      }
     } else {
 
       // uh this forkserver does not understand extended option passing
@@ -1010,8 +1156,8 @@ static void __afl_start_forkserver(void) {
   signal(SIGTERM, at_exit);
 
 #ifdef __linux__
-  if (/*!is_persistent &&*/ !__afl_cmp_map && !getenv("AFL_NO_SNAPSHOT") &&
-      afl_snapshot_init() >= 0) {
+  if (/*!is_persistent &&*/ !__afl_cmp_map && !__afl_pata_map &&
+      !getenv("AFL_NO_SNAPSHOT") && afl_snapshot_init() >= 0) {
 
     __afl_start_snapshots();
     return;
@@ -1041,6 +1187,11 @@ static void __afl_start_forkserver(void) {
 
   }
 
+  if (__afl_pata_metadata_len) {
+    status_for_fsrv |= FS_OPT_PATALOG;
+    status_for_fsrv &= (~FS_OPT_AUTODICT);
+  }
+
   if (__afl_sharedmem_fuzzing) { status_for_fsrv |= FS_OPT_SHDMEM_FUZZ; }
   if (status_for_fsrv) {
 
@@ -1057,7 +1208,8 @@ static void __afl_start_forkserver(void) {
 
   __afl_connected = 1;
 
-  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary)) {
+  if (__afl_sharedmem_fuzzing || (__afl_dictionary_len && __afl_dictionary) ||
+      __afl_pata_metadata_len) {
 
     if (read(FORKSRV_FD, &was_killed, 4) != 4) _exit(1);
 
@@ -1107,6 +1259,57 @@ static void __afl_start_forkserver(void) {
 
       }
 
+    }
+    
+    if ((was_killed & (FS_OPT_ENABLED | FS_OPT_PATALOG)) ==
+               (FS_OPT_ENABLED | FS_OPT_PATALOG) && __afl_pata_metadata_len) {
+      // great lets pass the dictionary through the forkserver FD
+      u32 len = __afl_pata_metadata_len, offset = 0;
+
+      if (write(FORKSRV_FD + 1, &len, 4) != 4) {
+
+        write(2, "Error: could not send PATA metadata len\n",
+              strlen("Error: could not send PATA metadata len\n"));
+        _exit(1);
+
+      }
+
+      while (len != 0) {
+        s32 ret;
+        ConstraintVariable *cv = __afl_pata_metadata + offset;
+        ret = write(FORKSRV_FD + 1, cv, sizeof(ConstraintVariable));
+
+        if (ret != sizeof(ConstraintVariable)) {
+
+          write(2, "Error: could not send metadata\n",
+                strlen("Error: could not send metadata\n"));
+          _exit(1);
+
+        }
+
+        if (cv->opaque) {
+          assert(cv->kind == PATA_KIND_SWITCH);
+          u32 num_cases = (cv->misc << 8 | cv->operation);
+          u32 data_size = num_cases * cv->size;
+          ret = write(FORKSRV_FD + 1, cv->opaque, data_size);
+          if (ret != data_size) {
+            write(2, "Error: could not send switch metadata\n",
+                strlen("Error: could not send switch metadata\n"));
+            _exit(1);
+          }
+        }
+        if (cv->bf) {
+          u32 data_size = cv->num_bf * sizeof(u32);
+          ret = write(FORKSRV_FD + 1, cv->bf, data_size);
+          if (ret != data_size) {
+            write(2, "Error: could not send block features in metadata\n",
+                strlen("Error: could not send block features in metadata\n"));
+            _exit(1);
+          }
+        }
+        len -= 1;
+        offset += 1;
+      }
     } else {
 
       // uh this forkserver does not understand extended option passing
@@ -1505,6 +1708,125 @@ void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
 
 #endif
 
+}
+
+void __sanitizer_pata_guard_init(uint32_t *start, uint32_t *stop) {
+  if (__afl_debug) {
+    fprintf(stderr,
+            "Running __sanitizer_pata_guard_init: %p-%p (%lu data entries) "
+            "after_fs=%u\n",
+            start, stop, (unsigned long)(stop - start),
+            __afl_already_initialized_forkserver);
+  }
+
+  if (start == stop || *start) return;
+
+  if (__afl_already_initialized_forkserver) {
+    fprintf(
+        stderr,
+        "[-] FATAL: forkserver is already up, but an instrumented dlopen() "
+        "library loaded afterwards. You must AFL_PRELOAD such libraries to "
+        "be able to fuzz them or LD_PRELOAD to run outside of afl-fuzz.\n"
+        "To ignore this set AFL_IGNORE_PROBLEMS=1.\n");
+    abort();
+
+    return;  // we are done for this special case
+  }
+
+  __afl_pata_metadata_len = 0;
+
+  while (start < stop) {
+
+    *(start++) = __afl_pata_metadata_len++;
+
+  }
+
+  if (__afl_debug) {
+
+    fprintf(stderr,
+            "Done __sanitizer_pata_guard_init: __afl_pata_metadata_len = %u\n",
+            __afl_pata_metadata_len);
+
+  }
+}
+
+void __sanitizer_pata_metadata_ptr_init(uint32_t ***start, uint32_t ***stop) {
+  if (__afl_debug) {
+    fprintf(stderr,
+            "Running __sanitizer_pata_metadata_ptr_init: %p-%p (%lu data entries) "
+            "after_fs=%u\n",
+            start, stop, (unsigned long)(stop - start),
+            __afl_already_initialized_forkserver);
+  }
+
+  if (start == stop) return;
+
+  if (__afl_already_initialized_forkserver) {
+    fprintf(
+        stderr,
+        "[-] FATAL: forkserver is already up, but an instrumented dlopen() "
+        "library loaded afterwards. You must AFL_PRELOAD such libraries to "
+        "be able to fuzz them or LD_PRELOAD to run outside of afl-fuzz.\n"
+        "To ignore this set AFL_IGNORE_PROBLEMS=1.\n");
+    abort();
+
+    return;  // we are done for this special case
+  }
+
+  __afl_pata_metadata_ptr = start;
+
+  if (__afl_debug) {
+
+    fprintf(stderr,
+            "Done __sanitizer_pata_metadata_ptr_init: __afl_pata_metadata_ptr = %p\n",
+            __afl_pata_metadata_ptr);
+
+  }
+}
+
+void __sanitizer_pata_metadata_init(ConstraintVariable *start,
+                                    ConstraintVariable *stop) {
+  if (__afl_debug) {
+    fprintf(stderr,
+            "Running __sanitizer_pata_metadata_init: %p-%p (%lu data entries) "
+            "after_fs=%u\n",
+            start, stop, (unsigned long)(stop - start),
+            __afl_already_initialized_forkserver);
+  }
+
+  if (start == stop) return;
+
+  if (__afl_already_initialized_forkserver) {
+    fprintf(
+        stderr,
+        "[-] FATAL: forkserver is already up, but an instrumented dlopen() "
+        "library loaded afterwards. You must AFL_PRELOAD such libraries to "
+        "be able to fuzz them or LD_PRELOAD to run outside of afl-fuzz.\n"
+        "To ignore this set AFL_IGNORE_PROBLEMS=1.\n");
+    abort();
+
+    return;  // we are done for this special case
+  }
+
+  u32 var_idx = 0;
+  __afl_pata_metadata = start;
+  while (start < stop) {
+    if (start->num_bf) {
+      for (uint32_t i = 0; i < start->num_bf; ++i) {
+        start->bf[i] = *__afl_pata_metadata_ptr[var_idx][i];
+      }
+    }
+    ++start;
+    ++var_idx;
+  }
+
+  if (__afl_debug) {
+
+    fprintf(stderr,
+            "Done __sanitizer_pata_metadata_init: __afl_pata_metadata = %p\n",
+            __afl_pata_metadata);
+
+  }
 }
 
 /* Init callback. Populates instrumentation IDs. Note that we're using
@@ -2345,6 +2667,7 @@ void __afl_coverage_off() {
 
     __afl_area_ptr = __afl_area_ptr_dummy;
     __afl_cmp_map = NULL;
+    __afl_pata_map = NULL;
 
   }
 
@@ -2357,6 +2680,9 @@ void __afl_coverage_on() {
 
     __afl_area_ptr = __afl_area_ptr_backup;
     if (__afl_cmp_map_backup) { __afl_cmp_map = __afl_cmp_map_backup; }
+    if (__afl_pata_map_backup) {
+      __afl_pata_map = __afl_pata_map_backup;
+    }
 
   }
 
@@ -2369,6 +2695,9 @@ void __afl_coverage_discard() {
   __afl_area_ptr_backup[0] = 1;
 
   if (__afl_cmp_map) { memset(__afl_cmp_map, 0, sizeof(struct cmp_map)); }
+  if (__afl_pata_map) {
+    memset(__afl_pata_map, 0, PATALOG_MAP_SIZE);
+  }
 
 }
 
@@ -2405,3 +2734,378 @@ void __afl_set_persistent_mode(u8 mode) {
 
 #undef write_error
 
+// #define PATA_DEBUG
+
+static inline u8 is_filtered(u32 id) {
+  u32 pata_filter = ((uint32_t*)__afl_pata_map)[2];
+  u8 ret = (pata_filter != PATA_FILTER_NONE) &&
+           (pata_filter == PATA_FILTER_ALL || pata_filter != id);
+#ifdef PATA_DEBUG
+  if (ret) {
+    printf("var #%d is filtered\n", id);
+  } else {
+    printf("var #%d is not filtered\n", id);
+  }
+  fflush(stdout);
+#endif
+  return ret;
+}
+
+void __patalog_ins_hook1(uint8_t arg1, uint8_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  __afl_pata_map_slot[0] = arg1;
+  __afl_pata_map_slot[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_ins_hook2(uint16_t arg1, uint16_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint16_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint16_t*)__afl_pata_map_slot)[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_ins_hook4(uint32_t arg1, uint32_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint32_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint32_t*)__afl_pata_map_slot)[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_ins_hook8(uint64_t arg1, uint64_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint64_t*)__afl_pata_map_slot)[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+#ifdef WORD_SIZE_64
+void __patalog_ins_hook16(uint128_t arg1, uint128_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint128_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint128_t*)__afl_pata_map_slot)[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_ins_hookN(uint128_t arg1, uint128_t arg2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(arg2) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint128_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint128_t*)__afl_pata_map_slot)[1] = arg2;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+#endif
+
+void __patalog_switch_hook1(uint8_t arg1, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint8_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_switch_hook2(uint16_t arg1, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint16_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_switch_hook4(uint32_t arg1, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint32_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_switch_hook8(uint64_t arg1, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  const uint32_t increment = sizeof(arg1) + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%08x\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = arg1;
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_memcmp_hook(uint8_t *str1, uint8_t *str2, uint64_t len, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  uint64_t increment = sizeof(len) + len * 2 + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%016lx\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = len;
+  __afl_pata_map_slot += sizeof(len);
+  __builtin_memcpy(__afl_pata_map_slot, str1, len);
+  __builtin_memcpy(__afl_pata_map_slot + len, str2, len);
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_strncmp_hook(uint8_t *str1, uint8_t *str2, uint64_t len, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  unsigned long len1 = strlen(str1);
+  unsigned long len2 = strlen(str2);
+
+  uint64_t increment = 2 * sizeof(len1) + len1 + len2 + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%016lx\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = len1;
+  __afl_pata_map_slot += sizeof(len1);
+  __builtin_memcpy(__afl_pata_map_slot, str1, len1);
+  __afl_pata_map_slot += len1;
+  ((uint64_t*)__afl_pata_map_slot)[0] = len2;
+  __afl_pata_map_slot += sizeof(len2);
+  __builtin_memcpy(__afl_pata_map_slot, str2, len2);
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_strcmp_hook(uint8_t *str1, uint8_t *str2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  unsigned long len1 = strlen(str1);
+  unsigned long len2 = strlen(str2);
+
+  uint64_t increment = 2 * sizeof(len1) + len1 + len2 + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%016lx\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = len1;
+  __afl_pata_map_slot += sizeof(len1);
+  __builtin_memcpy(__afl_pata_map_slot, str1, len1);
+  __afl_pata_map_slot += len1;
+  ((uint64_t*)__afl_pata_map_slot)[0] = len2;
+  __afl_pata_map_slot += sizeof(len2);
+  __builtin_memcpy(__afl_pata_map_slot, str2, len2);
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_memmem_hook(uint8_t *str1, uint64_t len1, uint8_t *str2, uint64_t len2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  uint64_t increment = 2 * sizeof(len1) + len1 + len2 + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%016lx\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = len1;
+  __afl_pata_map_slot += sizeof(len1);
+  __builtin_memcpy(__afl_pata_map_slot, str1, len1);
+  __afl_pata_map_slot += len1;
+  ((uint64_t*)__afl_pata_map_slot)[0] = len2;
+  __afl_pata_map_slot += sizeof(len2);
+  __builtin_memcpy(__afl_pata_map_slot, str2, len2);
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}
+
+void __patalog_strstr_hook(uint8_t *str1, uint8_t *str2, uint32_t id) {
+  if (unlikely(!__afl_pata_map)) return;
+  if (is_filtered(id)) return;
+
+  unsigned long len1 = strlen(str1);
+  unsigned long len2 = strlen(str2);
+
+  uint64_t increment = 2 * sizeof(len1) + len1 + len2 + sizeof(id);
+
+  u32 __afl_pata_map_cursor = ((uint32_t*)__afl_pata_map)[1];
+#ifdef PATA_DEBUG
+  printf("cursor at: 0x%08x, increment is: 0x%016lx\n", __afl_pata_map_cursor, increment); fflush(stdout);
+#endif
+  if (unlikely(__afl_pata_map_cursor + increment >= PATALOG_MAP_SIZE)) return;
+
+  *((uint32_t*)__afl_pata_map) += 1;
+
+  uint8_t *__afl_pata_map_slot = (uint8_t*)__afl_pata_map + __afl_pata_map_cursor;
+  *((uint32_t*)__afl_pata_map_slot) = id;
+  __afl_pata_map_slot += sizeof(id);
+  ((uint64_t*)__afl_pata_map_slot)[0] = len1;
+  __afl_pata_map_slot += sizeof(len1);
+  __builtin_memcpy(__afl_pata_map_slot, str1, len1);
+  __afl_pata_map_slot += len1;
+  ((uint64_t*)__afl_pata_map_slot)[0] = len2;
+  __afl_pata_map_slot += sizeof(len2);
+  __builtin_memcpy(__afl_pata_map_slot, str2, len2);
+  ((uint32_t*)__afl_pata_map)[1] += increment;
+}

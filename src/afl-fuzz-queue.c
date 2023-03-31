@@ -629,6 +629,7 @@ void destroy_queue(afl_state_t *afl) {
     q = afl->queue_buf[i];
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    afl_pata_on_queue_entry_destroy(q);
     ck_free(q);
 
   }

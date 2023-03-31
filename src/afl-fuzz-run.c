@@ -33,6 +33,7 @@
 #endif
 
 #include "cmplog.h"
+#include "patalog.h"
 
 #ifdef PROFILING
 u64 time_spent_working = 0;
@@ -388,6 +389,7 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   u8 *old_sn = afl->stage_name;
 
   if (unlikely(afl->shm.cmplog_mode)) { q->exec_cksum = 0; }
+  if (unlikely(afl->shm.patalog_mode)) { q->exec_cksum = 0; }
 
   /* Be a bit more generous about timeouts when resuming sessions, or when
      trying to calibrate already-added finds. This helps avoid trouble due
@@ -417,6 +419,13 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     }
 
+    if (afl->fsrv.patalog_binary &&
+        afl->fsrv.init_child_func != patalog_exec_child) {
+
+      FATAL("BUG in afl-fuzz detected. Patalog mode not set correctly.");
+
+    }
+
     afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
                    afl->afl_env.afl_debug_child);
 
@@ -434,6 +443,31 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
   /* we need a dummy run if this is LTO + cmplog */
   if (unlikely(afl->shm.cmplog_mode)) {
+
+    (void)write_to_testcase(afl, (void **)&use_mem, q->len, 1);
+
+    fault = fuzz_run_target(afl, &afl->fsrv, use_tmout);
+
+    /* afl->stop_soon is set by the handler for Ctrl+C. When it's pressed,
+       we want to bail out quickly. */
+
+    if (afl->stop_soon || fault != afl->crash_mode) { goto abort_calibration; }
+
+    if (!afl->non_instrumented_mode && !afl->stage_cur &&
+        !count_bytes(afl, afl->fsrv.trace_bits)) {
+
+      fault = FSRV_RUN_NOINST;
+      goto abort_calibration;
+
+    }
+
+#ifdef INTROSPECTION
+    if (unlikely(!q->bitsmap_size)) q->bitsmap_size = afl->bitsmap_size;
+#endif
+
+  }
+
+  if (unlikely(afl->shm.patalog_mode)) {
 
     (void)write_to_testcase(afl, (void **)&use_mem, q->len, 1);
 

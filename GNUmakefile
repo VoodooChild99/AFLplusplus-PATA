@@ -305,6 +305,8 @@ ifdef TEST_MMAP
 	LDFLAGS += -Wno-deprecated-declarations
 endif
 
+PATALOG_CXXFLAGS := $(filter-out -Wno-pointer-sign,$(CFLAGS))
+
 .PHONY: all
 all:	test_x86 test_shm test_python ready $(PROGS) afl-as llvm gcc_plugin test_build all_done
 	-$(MAKE) -C utils/aflpp_driver
@@ -448,8 +450,11 @@ src/afl-forkserver.o : $(COMM_HDR) src/afl-forkserver.c include/forkserver.h
 src/afl-sharedmem.o : $(COMM_HDR) src/afl-sharedmem.c include/sharedmem.h
 	$(CC) $(CFLAGS) $(CFLAGS_FLTO) -c src/afl-sharedmem.c -o src/afl-sharedmem.o
 
-afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o | test_x86
-	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm
+src/patalog.o: $(COMM_HDR) src/patalog.cc include/patalog.h
+	$(CXX) $(PATALOG_CXXFLAGS) $(CFLAGS_FLTO) -std=c++17 -c src/patalog.cc -o src/patalog.o
+
+afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/patalog.o src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o | test_x86
+	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/patalog.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm -lstdc++
 
 afl-showmap: src/afl-showmap.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(LDFLAGS)

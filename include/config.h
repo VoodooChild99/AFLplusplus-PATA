@@ -464,6 +464,10 @@
 
 #define CMPLOG_SHM_ENV_VAR "__AFL_CMPLOG_SHM_ID"
 
+/* AFL Pata */
+#define PATALOG_MAP_SIZE             (65536 << 12)
+#define PATALOG_SHM_ENV_VAR "__AFL_PATALOG_SHM_ID"
+
 /* CPU Affinity lockfile env var */
 
 #define CPU_AFFINITY_ENV_VAR "__AFL_LOCKFILE"

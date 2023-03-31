@@ -1178,6 +1178,45 @@ void show_stats_normal(afl_state_t *afl) {
   SAYF(bV bSTOP "py/custom/rq : " cRST "%-36s " bSTG bVR bH20 bH2 bH bRB "\n",
        tmp);
 
+  if (unlikely(afl->shm.patalog_mode)) {
+    sprintf(tmp, "%s/%s,",
+        u_stringify_int(IB(0), afl->stage_finds[STAGE_LENGTH_EXPLORE]),
+        u_stringify_int(IB(1), afl->stage_cycles[STAGE_LENGTH_EXPLORE]));
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(2), afl->stage_finds[STAGE_COPY_EXPLORE]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(3), afl->stage_cycles[STAGE_COPY_EXPLORE]));
+    
+  } else {
+
+    sprintf(tmp, "unused, unused");
+
+  }
+
+  SAYF(bV bSTOP "  PATA LE/CE : " cRST "%-36s " bSTG bV "\n", tmp);
+
+
+  tmp[0] = 0;
+  if (unlikely(afl->shm.patalog_mode)) {
+
+    sprintf(tmp, "%s/%s,",
+        u_stringify_int(IB(0), afl->stage_finds[STAGE_LINEAR_SEARCH]),
+        u_stringify_int(IB(1), afl->stage_cycles[STAGE_LINEAR_SEARCH]));
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(6), afl->stage_finds[STAGE_RANDOM_EXPLORE]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(7), afl->stage_cycles[STAGE_RANDOM_EXPLORE]));
+
+  } else {
+
+    sprintf(tmp, "unused, unused");
+
+  }
+
+  SAYF(bV bSTOP "  PATA LS/RE : " cRST "%-36s " bSTG bV "\n", tmp);
+
   if (likely(afl->disable_trim)) {
 
     sprintf(tmp, "disabled, ");
@@ -2019,6 +2058,48 @@ void show_stats_pizza(afl_state_t *afl) {
   SAYF(bV bSTOP "                      py/custom/rq : " cRST
                 "%-36s  " bSTG bVR bH20 bH2 bH30 bH2 bH bH bRB "\n",
        tmp);
+  
+  if (unlikely(afl->shm.patalog_mode)) {
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(0), afl->stage_finds[STAGE_LENGTH_EXPLORE]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(1), afl->stage_cycles[STAGE_LENGTH_EXPLORE]));
+    strcat(tmp, ", ");
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(2), afl->stage_finds[STAGE_COPY_EXPLORE]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(3), afl->stage_cycles[STAGE_COPY_EXPLORE]));
+    
+  } else {
+
+    strcat(tmp, " unused, unused");
+
+  }
+
+  SAYF(bV bSTOP "  PATA LE/CE : " cRST "%-36s " bSTG bV bSTOP "\n", tmp);
+
+  if (unlikely(afl->shm.patalog_mode)) {
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(4), afl->stage_finds[STAGE_LINEAR_SEARCH]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(5), afl->stage_cycles[STAGE_LINEAR_SEARCH]));
+    strcat(tmp, ", ");
+
+    strcat(tmp, " ");
+    strcat(tmp, u_stringify_int(IB(6), afl->stage_finds[STAGE_RANDOM_EXPLORE]));
+    strcat(tmp, "/");
+    strcat(tmp, u_stringify_int(IB(7), afl->stage_cycles[STAGE_RANDOM_EXPLORE]));
+
+  } else {
+
+    strcat(tmp, " unused, unused");
+
+  }
+
+  SAYF(bV bSTOP "  PATA LS/RE : " cRST "%-36s " bSTG bV bSTOP "\n", tmp);
 
   if (likely(afl->disable_trim)) {
 

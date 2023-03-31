@@ -1127,9 +1127,11 @@ int main(int argc, char **argv_orig, char **envp) {
   //  if (afl->shmem_testcase_mode) { setup_testcase_shmem(afl); }
 
   setenv("AFL_NO_AUTODICT", "1", 1);
+  setenv("AFL_NO_PATALOG", "1", 1);
 
   /* initialize cmplog_mode */
   shm.cmplog_mode = 0;
+  shm.patalog_mode = 0;
   setup_signal_handlers();
 
   set_up_environment(fsrv, argv);
@@ -1232,6 +1234,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   /* initialize cmplog_mode */
   shm_fuzz->cmplog_mode = 0;
+  shm_fuzz->patalog_mode = 0;
   u8 *map = afl_shm_init(shm_fuzz, MAX_FILE + sizeof(u32), 1);
   shm_fuzz->shmemfuzz_mode = true;
   if (!map) { FATAL("BUG: Zero return from afl_shm_init."); }

@@ -40,10 +40,13 @@ typedef struct sharedmem {
   char g_shm_file_path[L_tmpnam];
   int  cmplog_g_shm_fd;
   char cmplog_g_shm_file_path[L_tmpnam];
+  int  patalog_g_shm_fd;
+  char patalog_g_shm_file_path[L_tmpnam];
 /* ========================================= */
 #else
   s32 shm_id;                          /* ID of the SHM region              */
   s32 cmplog_shm_id;
+  s32 patalog_shm_id;
 #endif
 
   u8 *map;                                          /* shared memory region */
@@ -51,9 +54,10 @@ typedef struct sharedmem {
   size_t map_size;                                 /* actual allocated size */
 
   int             cmplog_mode;
+  int             patalog_mode;
   int             shmemfuzz_mode;
   struct cmp_map *cmp_map;
-
+  void           *pata_map;
 } sharedmem_t;
 
 u8  *afl_shm_init(sharedmem_t *, size_t, unsigned char non_instrumented_mode);

@@ -1059,9 +1059,11 @@ int main(int argc, char **argv_orig, char **envp) {
   }
 
   setenv("AFL_NO_AUTODICT", "1", 1);
+  setenv("AFL_NO_PATALOG", "1", 1);
 
   /* initialize cmplog_mode */
   shm.cmplog_mode = 0;
+  shm.patalog_mode = 0;
 
   atexit(at_exit_handler);
   setup_signal_handlers();
@@ -1146,6 +1148,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   /* initialize cmplog_mode */
   shm_fuzz->cmplog_mode = 0;
+  shm_fuzz->patalog_mode = 0;
   u8 *map = afl_shm_init(shm_fuzz, MAX_FILE + sizeof(u32), 1);
   shm_fuzz->shmemfuzz_mode = 1;
   if (!map) { FATAL("BUG: Zero return from afl_shm_init."); }

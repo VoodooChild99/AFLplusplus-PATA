@@ -144,6 +144,7 @@ typedef struct afl_forkserver {
   u8 *shmem_fuzz;                       /* allocated memory for fuzzing     */
 
   char *cmplog_binary;                  /* the name of the cmplog binary    */
+  char *patalog_binary;
 
   /* persistent mode replay functionality */
   u32 persistent_record;                /* persistent replay setting        */
@@ -162,6 +163,8 @@ typedef struct afl_forkserver {
   u8 *afl_ptr;                          /* for autodictionary: afl ptr      */
 
   void (*add_extra_func)(void *afl_ptr, u8 *mem, u32 len);
+  void (*add_pata_metadata)(void *afl_ptr, u8 *mem, u32 id);
+  void (*reserve_metadata)(void *afl_ptr, u32 num);
 
   u8 child_kill_signal;
   u8 fsrv_kill_signal;

@@ -991,6 +991,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   /* initialize cmplog_mode */
   shm.cmplog_mode = 0;
+  shm.patalog_mode = 0;
 
   atexit(at_exit_handler);
   setup_signal_handlers();

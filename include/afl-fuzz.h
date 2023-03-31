@@ -200,6 +200,11 @@ struct queue_entry {
 
   u8             *cmplog_colorinput;    /* the result buf of colorization   */
   struct tainted *taint;                /* Taint information from CmpLog    */
+  void           *RVS;                  /* RVS from patalog */
+  void           *seq_per_var;
+  void           *unstable_var;
+  void           *critical_bytes;
+  void           *solved;
 
   struct queue_entry *mother;           /* queue entry this based on        */
 
@@ -247,6 +252,10 @@ enum {
   /* 19 */ STAGE_CUSTOM_MUTATOR,
   /* 20 */ STAGE_COLORIZATION,
   /* 21 */ STAGE_ITS,
+  /* 22 */ STAGE_LENGTH_EXPLORE,
+  /* 23 */ STAGE_COPY_EXPLORE,
+  /* 24 */ STAGE_LINEAR_SEARCH,
+  /* 25 */ STAGE_RANDOM_EXPLORE,
 
   STAGE_NUM_MAX
 
@@ -661,6 +670,12 @@ typedef struct afl_state {
   char            *cmplog_binary;
   afl_forkserver_t cmplog_fsrv;     /* cmplog has its own little forkserver */
 
+  /* PataLog */
+  char            *patalog_binary;
+  afl_forkserver_t patalog_fsrv;
+  struct ConstraintVariable *pata_metadata;
+  u32 num_pata_metadata_entries;
+
   /* Custom mutators */
   struct custom_mutator *mutator;
 
@@ -674,6 +689,8 @@ typedef struct afl_state {
 
   struct afl_pass_stat *pass_stats;
   struct cmp_map       *orig_cmp_map;
+  u8                   *orig_pata_map;
+  u8                   *orig_map;
 
   u8 describe_op_buf_256[256]; /* describe_op will use this to return a string
                                   up to 256 */
@@ -1197,6 +1214,15 @@ u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len);
 
 /* RedQueen */
 u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);
+
+/* Pata */
+u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);
+u8 common_fuzz_patalog_stuff(afl_state_t *afl, u8 *out_buf, u32 len);
+void afl_pata_deinit(afl_state_t *afl);
+void afl_pata_on_queue_entry_destroy(struct queue_entry *q);
+void add_pata_metadata(afl_state_t *afl, u8 *cv, u32 id);
+void reserve_metadata(afl_state_t *afl, u32 num);
+
 
 /* our RNG wrapper */
 AFL_RAND_RETURN rand_next(afl_state_t *afl);

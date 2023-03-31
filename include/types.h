@@ -62,6 +62,7 @@ typedef uint128_t         u128;
 #define FS_OPT_GET_MAPSIZE(x) (((x & 0x00fffffe) >> 1) + 1)
 #define FS_OPT_SET_MAPSIZE(x) \
   (x <= 1 || x > FS_OPT_MAX_MAPSIZE ? 0 : ((x - 1) << 1))
+#define FS_OPT_PATALOG 0x04000000
 
 typedef unsigned long long u64;
 

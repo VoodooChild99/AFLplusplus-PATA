@@ -33,6 +33,7 @@
 #include "list.h"
 #include "forkserver.h"
 #include "hash.h"
+#include "patalog.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -389,6 +390,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
   s32   status;
   s32   rlen;
   char *ignore_autodict = getenv("AFL_NO_AUTODICT");
+  char *ignore_patalog = getenv("AFL_NO_PATALOG");
 
 #ifdef __linux__
   if (unlikely(fsrv->nyx_mode)) {
@@ -604,6 +606,10 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     }
 
+    if (!fsrv->patalog_binary) {
+      unsetenv(PATALOG_SHM_ENV_VAR);
+    }
+
     /* Umpf. On OpenBSD, the default fd limit for root users is set to
        soft 128. Let's try to fix that... */
     if (!getrlimit(RLIMIT_NOFILE, &r) && r.rlim_cur < FORKSRV_FD + 2) {
@@ -707,6 +713,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
   sprintf(pid_buf, "%d", fsrv->fsrv_pid);
   if (fsrv->cmplog_binary)
     setenv("__AFL_TARGET_PID2", pid_buf, 1);
+  else if (fsrv->patalog_binary)
+    setenv("__AFL_TARGET_PID3", pid_buf, 1);
   else
     setenv("__AFL_TARGET_PID1", pid_buf, 1);
 
@@ -809,7 +817,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
           fsrv->use_shmem_fuzz = 1;
           if (!be_quiet) { ACTF("Using SHARED MEMORY FUZZING feature."); }
 
-          if ((status & FS_OPT_AUTODICT) == 0 || ignore_autodict) {
+          if (((status & FS_OPT_AUTODICT) == 0 || ignore_autodict) &&
+              ((status & FS_OPT_PATALOG) == 0 || ignore_patalog)) {
 
             u32 send_status = (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ);
             if (write(fsrv->fsrv_ctl_fd, &send_status, 4) != 4) {
@@ -959,6 +968,117 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
           if (!be_quiet) { ACTF("Loaded %u autodictionary entries", count); }
           ck_free(dict);
 
+        }
+
+      }
+
+      if ((status & FS_OPT_PATALOG) == FS_OPT_PATALOG) {
+
+        if (!ignore_patalog) {
+          if (fsrv->add_pata_metadata == NULL || fsrv->reserve_metadata == NULL) {
+
+            // this is not patalog - we deny and return
+            if (fsrv->use_shmem_fuzz) {
+
+              status = (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ);
+
+            } else {
+
+              status = (FS_OPT_ENABLED);
+
+            }
+
+            if (write(fsrv->fsrv_ctl_fd, &status, 4) != 4) {
+
+              FATAL("Writing to forkserver failed.");
+
+            }
+
+            return;
+
+          }
+
+          if (!be_quiet) { ACTF("Using PATALOG feature."); }
+
+          if (fsrv->use_shmem_fuzz) {
+
+            status = (FS_OPT_ENABLED | FS_OPT_PATALOG | FS_OPT_SHDMEM_FUZZ);
+
+          } else {
+
+            status = (FS_OPT_ENABLED | FS_OPT_PATALOG);
+
+          }
+
+          if (write(fsrv->fsrv_ctl_fd, &status, 4) != 4) {
+
+            FATAL("Writing to forkserver failed.");
+
+          }
+
+          if (read(fsrv->fsrv_st_fd, &status, 4) != 4) {
+
+            FATAL("Reading from forkserver failed.");
+
+          }
+
+          if (status < 2 || (u32)status > 0xffffff) {
+
+            FATAL("Patalog has an illegal size: %d", status);
+
+          }
+
+          u32 offset = 0;
+          u32 len = status;
+          ConstraintVariable cv;
+          fsrv->reserve_metadata(fsrv->afl_ptr, len);
+
+          while (len != 0) {
+
+            rlen = read(fsrv->fsrv_st_fd, &cv, sizeof(ConstraintVariable));
+
+            if (rlen != sizeof(ConstraintVariable)) {
+              FATAL(
+                "Reading PATA metadata fail at index %u with %u left.",
+                offset, len);
+            }
+            
+            if (cv.opaque) {
+              u32 num_cases = (cv.misc << 8 | cv.operation);
+              u32 data_size = num_cases * cv.size;
+              cv.opaque = ck_alloc(data_size);
+              if (cv.opaque == NULL) {
+                FATAL("Could not allocate %u bytes of PATA switch metadata memory", data_size);
+              }
+              rlen = read(fsrv->fsrv_st_fd, cv.opaque, data_size);
+              if (rlen != (s32)data_size) {
+                FATAL(
+                "Reading PATA switch metadata fail at index %u with %u left.",
+                offset, len);
+              }
+            }
+
+            if (cv.bf) {
+              u32 data_size = cv.num_bf * sizeof(u32);
+              cv.bf = ck_alloc(data_size);
+              if (cv.bf == NULL) {
+                FATAL("Could not allocate %u bytes of PATA block feature memory", data_size);
+              }
+              rlen = read(fsrv->fsrv_st_fd, cv.bf, data_size);
+              if (rlen != (s32)data_size) {
+                FATAL(
+                "Reading PATA block features fail at index %u with %u left.",
+                offset, len);
+              }
+            }
+
+            fsrv->add_pata_metadata(fsrv->afl_ptr, (u8*)(&cv), offset);
+
+            --len;
+            ++offset;
+          }
+
+          if (!be_quiet) { ACTF("Loaded %u PATA metadata entries", offset); }
         }
 
       }
