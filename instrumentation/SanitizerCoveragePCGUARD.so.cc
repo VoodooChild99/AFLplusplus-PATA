@@ -2340,7 +2340,7 @@ GlobalVariable *ModuleSanitizerCoverageAFL::
 CreateModuleDataInSection(Function &F, Type *Ty, const char *Section) {
   auto       Data = new GlobalVariable(
             *CurModule, Ty, false, GlobalVariable::PrivateLinkage,
-            Constant::getNullValue(Ty), "__sancov_gen_");
+            Constant::getNullValue(Ty), "__sancov_pata_gen_");
 
 #if LLVM_VERSION_MAJOR >= 13
   if (TargetTriple.supportsCOMDAT() &&
