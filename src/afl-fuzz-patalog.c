@@ -70,7 +70,9 @@ u8 common_fuzz_patalog_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 }
 
 void add_pata_metadata(afl_state_t *afl, u8 *cv, u32 id) {
-  assert(id < afl->num_pata_metadata_entries);
+  if (id >= afl->num_pata_metadata_entries) {
+    FATAL("invalid id when adding PATA metadata");
+  }
   memcpy(afl->pata_metadata + id, cv, sizeof(ConstraintVariable));
 }
 
