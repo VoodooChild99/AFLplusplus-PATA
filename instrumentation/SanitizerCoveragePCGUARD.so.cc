@@ -247,7 +247,8 @@ class ModuleSanitizerCoverageAFL
   PointerType *Int32PtrPtrTy, *Int32PtrPtrPtrTy;
   Constant *Null;
 
-  GlobalVariable *CreateModuleDataInSection(Type *Ty, const char *Section);
+  GlobalVariable *CreateModuleDataInSection(Function &F, Type *Ty,
+                                            const char *Section);
   void initializePataGlobals(Module &M);
   bool hookCmps(Module &M);
   bool hookSwitches(Module &M);
@@ -797,8 +798,9 @@ bool ModuleSanitizerCoverageAFL::hookCmps(Module &M) {
           }
 
           if (!redundant) {
+            Function &cur_func = *selectcmpInst->getFunction();
             args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-                Int32Ty, SanCovPataGuardSectionName)));
+                cur_func, Int32Ty, SanCovPataGuardSectionName)));
             uint32_t real_size;
             switch (cast_size) {
               case 8:
@@ -841,7 +843,7 @@ bool ModuleSanitizerCoverageAFL::hookCmps(Module &M) {
                 M, *selectcmpInst, cur_id,
                 "__afl_pata_cmp_bf_ptr_", "__afl_pata_cmp_bf_", num_succ, bf);
             ModulePataMetadata = CreateModuleDataInSection(
-                PataMetadataTy, SanCovPataMetadataSectionName);
+                cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
             ModulePataMetadata->setInitializer(
               ConstantStruct::get(PataMetadataTy, {
                 ConstantPointerNull::get(voidPtrTy),
@@ -854,7 +856,7 @@ bool ModuleSanitizerCoverageAFL::hookCmps(Module &M) {
               }));
             ModulePataMetadata->setAlignment(MaybeAlign(4));
             ModulePataMetadataPtr = CreateModuleDataInSection(
-                Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+                cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
             ModulePataMetadataPtr->setInitializer(bf_ptr);
             // pata_metadata.push_back(ModulePataMetadata);
           }
@@ -1149,9 +1151,10 @@ bool ModuleSanitizerCoverageAFL::hookSwitches(Module &M) {
 
         if (!redundant) {
           std::vector<Value *> args;
+          Function &cur_func = *SI->getFunction();
           args.push_back(CompareTo);
           args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-              Int32Ty, SanCovPataGuardSectionName)));
+              cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
           bool created = false;
           uint32_t real_size;
@@ -1208,7 +1211,7 @@ bool ModuleSanitizerCoverageAFL::hookSwitches(Module &M) {
                 "__afl_pata_switch_bf_ptr_", "__afl_pata_switch_bf_",
                 num_succ, bf);
             ModulePataMetadata = CreateModuleDataInSection(
-                PataMetadataTy, SanCovPataMetadataSectionName);
+                cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
             ModulePataMetadata->setInitializer(
               ConstantStruct::get(PataMetadataTy, {
                 cases_metadata,
@@ -1221,7 +1224,7 @@ bool ModuleSanitizerCoverageAFL::hookSwitches(Module &M) {
               }));
             ModulePataMetadata->setAlignment(MaybeAlign(4));
             ModulePataMetadataPtr = CreateModuleDataInSection(
-              Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+                cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
             ModulePataMetadataPtr->setInitializer(bf_ptr);
           }
         }
@@ -1468,6 +1471,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
   u32 num_succ;
   Constant *bf;
   Constant *bf_ptr;
+  Function *cur_func;
   for (auto &callInst : Memcmp) {
 
     Value *v1P = callInst->getArgOperand(0), *v2P = callInst->getArgOperand(1),
@@ -1491,6 +1495,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
     }
     
     if (!redundant) {
+      cur_func = callInst->getFunction();
       std::vector<Value *> args;
       Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
       Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
@@ -1502,7 +1507,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
       args.push_back(v2Pcasted);
       args.push_back(v3Pcasted);
       args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-          Int32Ty, SanCovPataGuardSectionName)));
+          *cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
       IRB.CreateCall(patalogHookMemcmp, args);
 
@@ -1510,7 +1515,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
           M, *callInst, cur_id,
           "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
       ModulePataMetadata = CreateModuleDataInSection(
-          PataMetadataTy, SanCovPataMetadataSectionName);
+          *cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
       ModulePataMetadata->setInitializer(
         ConstantStruct::get(PataMetadataTy, {
           ConstantPointerNull::get(voidPtrTy),
@@ -1523,7 +1528,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
         }));
       ModulePataMetadata->setAlignment(MaybeAlign(4));
       ModulePataMetadataPtr = CreateModuleDataInSection(
-          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+          *cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
       ModulePataMetadataPtr->setInitializer(bf_ptr);
     }
 
@@ -1553,13 +1558,14 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
     }
 
     if (!redundant) {
+      cur_func = callInst->getFunction();
       std::vector<Value *> args;
       Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
       Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
       args.push_back(v1Pcasted);
       args.push_back(v2Pcasted);
       args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-          Int32Ty, SanCovPataGuardSectionName)));
+          *cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
       IRB.CreateCall(patalogHookStrcmp, args);
 
@@ -1567,7 +1573,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
           M, *callInst, cur_id,
           "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
       ModulePataMetadata = CreateModuleDataInSection(
-          PataMetadataTy, SanCovPataMetadataSectionName);
+          *cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
       ModulePataMetadata->setInitializer(
         ConstantStruct::get(PataMetadataTy, {
           ConstantPointerNull::get(voidPtrTy),
@@ -1580,7 +1586,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
         }));
       ModulePataMetadata->setAlignment(MaybeAlign(4));
       ModulePataMetadataPtr = CreateModuleDataInSection(
-          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+          *cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
       ModulePataMetadataPtr->setInitializer(bf_ptr);
     }
 
@@ -1611,6 +1617,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
     }
 
     if (!redundant) {
+      cur_func = callInst->getFunction();
       std::vector<Value *> args;
       Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
       Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
@@ -1622,7 +1629,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
       args.push_back(v2Pcasted);
       args.push_back(v3Pcasted);
       args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-          Int32Ty, SanCovPataGuardSectionName)));
+          *cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
       IRB.CreateCall(patalogHookStrncmp, args);
 
@@ -1630,7 +1637,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
           M, *callInst, cur_id,
           "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
       ModulePataMetadata = CreateModuleDataInSection(
-          PataMetadataTy, SanCovPataMetadataSectionName);
+          *cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
       ModulePataMetadata->setInitializer(
         ConstantStruct::get(PataMetadataTy, {
           ConstantPointerNull::get(voidPtrTy),
@@ -1643,7 +1650,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
         }));
       ModulePataMetadata->setAlignment(MaybeAlign(4));
       ModulePataMetadataPtr = CreateModuleDataInSection(
-          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+          *cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
       ModulePataMetadataPtr->setInitializer(bf_ptr);
     }
 
@@ -1672,13 +1679,14 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
     }
 
     if (!redundant) {
+      cur_func = callInst->getFunction();
       std::vector<Value *> args;
       Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
       Value               *v2Pcasted = IRB.CreatePointerCast(v2P, Int8PtrTy);
       args.push_back(v1Pcasted);
       args.push_back(v2Pcasted);
       args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-          Int32Ty, SanCovPataGuardSectionName)));
+          *cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
       IRB.CreateCall(patalogHookStrstr, args);
 
@@ -1686,7 +1694,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
           M, *callInst, cur_id,
           "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
       ModulePataMetadata = CreateModuleDataInSection(
-          PataMetadataTy, SanCovPataMetadataSectionName);
+          *cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
       ModulePataMetadata->setInitializer(
         ConstantStruct::get(PataMetadataTy, {
           ConstantPointerNull::get(voidPtrTy),
@@ -1699,7 +1707,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
         }));
       ModulePataMetadata->setAlignment(MaybeAlign(4));
       ModulePataMetadataPtr = CreateModuleDataInSection(
-          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+          *cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
       ModulePataMetadataPtr->setInitializer(bf_ptr);
     }
   }
@@ -1726,6 +1734,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
     }
     
     if (!redundant) {
+      cur_func = callInst->getFunction();
       std::vector<Value *> args;
       Value               *v1Pcasted = IRB.CreatePointerCast(v1P, Int8PtrTy);
       Value               *v3Pcasted = IRB.CreatePointerCast(v3P, Int8PtrTy);
@@ -1742,7 +1751,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
       args.push_back(v3Pcasted);
       args.push_back(v4Pcasted);
       args.push_back(IRB.CreateLoad(Int32Ty, CreateModuleDataInSection(
-          Int32Ty, SanCovPataGuardSectionName)));
+          *cur_func, Int32Ty, SanCovPataGuardSectionName)));
 
       IRB.CreateCall(patalogHookMemmem, args);
 
@@ -1750,7 +1759,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
           M, *callInst, cur_id,
           "__afl_pata_call_bf_ptr_", "__afl_pata_call_bf_", num_succ, bf);
       ModulePataMetadata = CreateModuleDataInSection(
-          PataMetadataTy, SanCovPataMetadataSectionName);
+          *cur_func, PataMetadataTy, SanCovPataMetadataSectionName);
       ModulePataMetadata->setInitializer(
         ConstantStruct::get(PataMetadataTy, {
           ConstantPointerNull::get(voidPtrTy),
@@ -1763,7 +1772,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
         }));
       ModulePataMetadata->setAlignment(MaybeAlign(4));
       ModulePataMetadataPtr = CreateModuleDataInSection(
-          Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
+          *cur_func, Int32PtrPtrTy, SanCovPataMetadataPtrSectionName);
       ModulePataMetadataPtr->setInitializer(bf_ptr);
     }
   }
@@ -2328,14 +2337,28 @@ GlobalVariable *ModuleSanitizerCoverageAFL::CreateFunctionLocalArrayInSection(
 
 /* PATA start */
 GlobalVariable *ModuleSanitizerCoverageAFL::
-CreateModuleDataInSection(Type *Ty, const char *Section) {
+CreateModuleDataInSection(Function &F, Type *Ty, const char *Section) {
   auto       Data = new GlobalVariable(
             *CurModule, Ty, false, GlobalVariable::PrivateLinkage,
             Constant::getNullValue(Ty), "__sancov_gen_");
 
+#if LLVM_VERSION_MAJOR >= 13
+  if (TargetTriple.supportsCOMDAT() &&
+      (TargetTriple.isOSBinFormatELF() || !F.isInterposable()))
+    if (auto Comdat = getOrCreateFunctionComdat(F, TargetTriple))
+      Data->setComdat(Comdat);
+#else
+  if (TargetTriple.supportsCOMDAT() && !F.isInterposable())
+    if (auto Comdat =
+            GetOrCreateFunctionComdat(F, TargetTriple, CurModuleUniqueId))
+      Data->setComdat(Comdat);
+#endif
+
   Data->setSection(getSectionName(Section));
   GlobalsToAppendToUsed.push_back(Data);
   GlobalsToAppendToCompilerUsed.push_back(Data);
+  MDNode *MD = MDNode::get(F.getContext(), ValueAsMetadata::get(&F));
+  Data->addMetadata(LLVMContext::MD_associated, *MD);
 
   return Data;
 }
