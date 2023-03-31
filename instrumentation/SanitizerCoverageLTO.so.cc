@@ -270,9 +270,9 @@ class ModuleSanitizerCoverageLTO
   /* PATA begin */
   uint8_t patalog_mode = 0;
   uint32_t pata_global_id = 0;
-  std::map<Value*, uint8_t> value_to_type;
+  DenseMap<Value*, uint8_t> value_to_type;
   std::vector<Constant*> pata_metadata;
-  std::map<BasicBlock*, uint32_t> block_to_id;
+  DenseMap<BasicBlock*, uint32_t> block_to_id;
 
   StructType *PataMetadataTy;
   Type *VoidTy;

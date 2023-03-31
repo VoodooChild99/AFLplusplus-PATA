@@ -234,8 +234,8 @@ class ModuleSanitizerCoverageAFL
   /* PATA begin */
   uint8_t patalog_mode = 0;
   uint32_t pata_global_id = 0;
-  std::map<Value*, uint32_t> value_to_type;
-  std::map<BasicBlock*, Constant*> block_to_id;
+  DenseMap<Value*, uint32_t> value_to_type;
+  DenseMap<BasicBlock*, Constant*> block_to_id;
   GlobalVariable *ModulePataMetadata, *ModulePataMetadataPtr;
   GlobalVariable *PataTmpGuardArray;
 
