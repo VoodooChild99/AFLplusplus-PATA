@@ -108,6 +108,7 @@ const char SanCovPCsSectionName[] = "sancov_pcs";
 const char SanCovPataGuardSectionName[] = "sancov_pata_guard";
 const char SanCovPataMetadataSectionName[] = "sancov_pata_metadata";
 const char SanCovPataMetadataPtrSectionName[] = "sancov_pata_metadata_ptr";
+const char SanCovPataMetadataPtrDataSectionName[] = "sancov_pata_metadata_ptr_data";
 /* PATA end */
 
 const char SanCovLowestStackName[] = "__sancov_lowest_stack";
@@ -322,16 +323,14 @@ collectBlockFeatures(Module &M, Instruction &I, u32 cur_id,
   // different from LTO, we hold pointers to block ids here
   if (num_successors) {
     // Ptr array
-    auto global_name = ptr_name_prefix + std::to_string(cur_id);
     auto tmp_ty = ArrayType::get(Int32PtrTy, num_successors);
-    M.getOrInsertGlobal(global_name, tmp_ty);
-    auto bf_ptr = M.getNamedGlobal(global_name);
-    // avoid name collisions
-    bf_ptr->setLinkage(llvm::GlobalValue::InternalLinkage);
+    auto bf_ptr = CreateFunctionLocalArrayInSection(
+        num_successors, *I.getFunction(), Int32PtrTy,
+        SanCovPataMetadataPtrDataSectionName);
     bf_ptr->setInitializer(ConstantArray::get(tmp_ty, successor_ids));
 
     // real array
-    global_name = name_prefix + std::to_string(cur_id);
+    auto global_name = name_prefix + std::to_string(cur_id);
     tmp_ty = ArrayType::get(Int32Ty, num_successors);
     M.getOrInsertGlobal(global_name, tmp_ty);
     auto bf_tmp = M.getNamedGlobal(global_name);
