@@ -644,7 +644,6 @@ static inline u8 is_meaningful_to_mutate(afl_state_t *afl,
                                          const UnstableVarTy &unstable_var,
                                          u8 solved) {
   return (solved == 0) &&
-         (afl->pata_metadata[data.var_id].num_bf >= 2) &&
          (unstable_var.find(data.var_id) == unstable_var.end());
 }
 
@@ -2550,6 +2549,10 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
     if (++afl->stage_cur % screen_update == 0) { show_stats(afl); }
     if (!is_meaningful_to_mutate(afl, v, *unstable_var, (*solved)[cur_idx])) {
       continue;
+    }
+
+    if (cv->num_bf < 2) {
+      (*solved)[cur_idx] = 1;
     }
 
     orig_cov.clear();

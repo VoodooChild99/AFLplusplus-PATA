@@ -56,6 +56,33 @@ extern "C" {
 
 }
 
+#include <set>
+
+#define MEMCMP_FNAMES \
+  "memcmp", "bcmp", "CRYPTO_memcmp", "OPENSSL_memcmp", "memcmp_const_time", \
+  "memcmpct"
+
+#define STRCMP_FNAMES \
+  "strcmp", "strcasecmp", "xmlStrcmp", "xmlStrEqual", "g_strcmp0",  \
+  "curl_strequal", "strcsequal", "stricmp", "ap_cstr_casecmp",  \
+  "OPENSSL_strcasecmp", "xmlStrcasecmp", "g_strcasecmp", "g_ascii_strcasecmp", \
+  "Curl_strcasecompare", "Curl_safe_strcasecompare", "cmsstrcasecmp"
+
+#define STRSTR_FNAMES \
+  "strstr", "strcasestr", "g_strstr_len", "ap_strcasestr", "xmlStrstr", \
+  "xmlStrcasestr", "g_str_has_prefix", "g_str_has_suffix"
+
+#define STRNCMP_FNAMES \
+  "strncmp", "strncasecmp", "xmlStrncmp", "curl_strnequal", "strnicmp", \
+  "ap_cstr_casecmpn", "OPENSSL_strncasecmp", "xmlStrncasecmp",  \
+  "g_ascii_strncasecmp", "Curl_strncasecompare", "g_strncasecmp"
+
+#define MEMMEM_FNAMES \
+  "memmem"
+
+#define MEM_STR_FNAMES \
+  MEMCMP_FNAMES, STRCMP_FNAMES, STRSTR_FNAMES, STRNCMP_FNAMES, MEMMEM_FNAMES
+
 using namespace llvm;
 
 #define DEBUG_TYPE "sancov"
@@ -248,6 +275,13 @@ class ModuleSanitizerCoverageAFL
   PointerType *Int32PtrPtrTy, *Int32PtrPtrPtrTy;
   Constant *Null;
 
+  const static std::set<std::string> memcmp_fn;
+  const static std::set<std::string> strcmp_fn;
+  const static std::set<std::string> strstr_fn;
+  const static std::set<std::string> strncmp_fn;
+  const static std::set<std::string> memmem_fn;
+  const static std::set<std::string> mem_str_fn;
+
   GlobalVariable *CreateModuleDataInSection(Function &F, Type *Ty,
                                             const char *Section);
   void initializePataGlobals(Module &M);
@@ -290,6 +324,31 @@ llvmGetPassPluginInfo() {
 #endif
 
 /* PATA begin */
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::memcmp_fn {
+  MEMCMP_FNAMES
+};
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::strcmp_fn {
+  STRCMP_FNAMES
+};
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::strstr_fn {
+  STRSTR_FNAMES
+};
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::strncmp_fn {
+  STRNCMP_FNAMES
+};
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::memmem_fn {
+  MEMMEM_FNAMES
+};
+
+const std::set<std::string> ModuleSanitizerCoverageAFL::mem_str_fn {
+  MEM_STR_FNAMES
+};
+
 template <class Iterator>
 Iterator Unique(Iterator first, Iterator last) {
 
@@ -1381,30 +1440,26 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
 
           }
 
-          bool isMemcmp =
-              (!FuncName.compare("memcmp") || !FuncName.compare("bcmp"));
+          bool isMemcmp = (memcmp_fn.find(FuncName) != memcmp_fn.end());
           isMemcmp &= FT->getNumParams() == 3 &&
                       FT->getReturnType()->isIntegerTy(32) &&
                       FT->getParamType(0)->isPointerTy() &&
                       FT->getParamType(1)->isPointerTy() &&
                       FT->getParamType(2)->isIntegerTy();
 
-          bool isStrcmp =
-              (!FuncName.compare("strcmp") || !FuncName.compare("strcasecmp"));
+          bool isStrcmp = (strcmp_fn.find(FuncName) != strcmp_fn.end());
           isStrcmp &=
               FT->getNumParams() == 2 && FT->getReturnType()->isIntegerTy(32) &&
               FT->getParamType(0) == FT->getParamType(1) &&
               FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
 
-          bool isStrstr = 
-            (!FuncName.compare("strstr") || !FuncName.compare("strcasestr"));
+          bool isStrstr = (strstr_fn.find(FuncName) != strstr_fn.end());
           isStrstr &=
               FT->getNumParams() == 2 && FT->getReturnType()->isPointerTy() &&
               FT->getParamType(0) == FT->getParamType(1) &&
               FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
           
-          bool isStrncmp = (!FuncName.compare("strncmp") ||
-                            !FuncName.compare("strncasecmp"));
+          bool isStrncmp = (strncmp_fn.find(FuncName) != strncmp_fn.end());
           isStrncmp &= FT->getNumParams() == 3 &&
                        FT->getReturnType()->isIntegerTy(32) &&
                        FT->getParamType(0) == FT->getParamType(1) &&
@@ -1412,7 +1467,7 @@ bool ModuleSanitizerCoverageAFL::hookRtns(Module &M) {
                            IntegerType::getInt8PtrTy(M.getContext()) &&
                        FT->getParamType(2)->isIntegerTy();
           
-          bool isMemmem = !FuncName.compare("memmem");
+          bool isMemmem = (memmem_fn.find(FuncName) != memmem_fn.end());
           isMemmem &= FT->getNumParams() == 4 &&
                       FT->getReturnType()->isPointerTy() &&
                       FT->getParamType(0) == FT->getParamType(2) &&

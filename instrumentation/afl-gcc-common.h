@@ -111,6 +111,7 @@ struct afl_base_pass : gimple_opt_pass {
         "__asan",
         "__msan",
         "__cmplog",
+        "__patalog",
         "__sancov",
         "msan.",
         "LLVMFuzzerM",

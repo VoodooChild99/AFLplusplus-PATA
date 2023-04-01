@@ -69,6 +69,7 @@ bool isIgnoreFunction(const llvm::Function *F) {
       "__asan",
       "__msan",
       "__cmplog",
+      "__patalog",
       "__sancov",
       "__san",
       "__cxx_",
