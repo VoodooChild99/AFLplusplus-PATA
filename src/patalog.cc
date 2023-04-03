@@ -2500,9 +2500,9 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   // Store cov map
   if (unlikely(!afl->orig_map)) {
-    afl->orig_map = (u8*)ck_alloc(afl->fsrv.map_size);
+    afl->orig_map = (u8*)ck_alloc(afl->patalog_fsrv.map_size);
   }
-  memcpy(afl->orig_map, afl->fsrv.trace_bits, afl->fsrv.map_size);
+  memcpy(afl->orig_map, afl->fsrv.trace_bits, afl->patalog_fsrv.map_size);
 
   // Get sequence for each variable
   if (!afl->queue_cur->seq_per_var) {

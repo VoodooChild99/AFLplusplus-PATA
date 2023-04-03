@@ -584,17 +584,17 @@ u8 fuzz_one_original(afl_state_t *afl) {
   }
 
   if (unlikely(afl->shm.patalog_mode) && len > 0) {
-    // if (afl->queue_cur->favored ||
-    //     (afl->queue_cur->tc_ref ||
-    //       afl->fsrv.total_execs % afl->queued_items <= 10) ||
-    //     get_cur_time() - afl->last_find_time > 250000) {
-    //   if (pata_stage(afl, in_buf, out_buf, len)) {
-    //     goto abandon_entry;
-    //   }
-    // }
-    if (pata_stage(afl, in_buf, out_buf, len)) {
-      goto abandon_entry;
+    if (afl->queue_cur->favored ||
+        (afl->queue_cur->tc_ref ||
+          afl->fsrv.total_execs % afl->queued_items <= 10) ||
+        get_cur_time() - afl->last_find_time > 250000) {
+      if (pata_stage(afl, in_buf, out_buf, len)) {
+        goto abandon_entry;
+      }
     }
+    // if (pata_stage(afl, in_buf, out_buf, len)) {
+    //   goto abandon_entry;
+    // }
   }
 
   /* Skip right away if -d is given, if it has not been chosen sufficiently
@@ -3318,15 +3318,15 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
   }
 
   if (unlikely(afl->shm.patalog_mode) && len > 0) {
-    // if (!(afl->fsrv.total_execs % afl->queued_items) ||
-    //       get_cur_time() - afl->last_find_time > 300000) {
-    //   if (pata_stage(afl, in_buf, out_buf, len)) {
-    //     goto abandon_entry;
-    //   }
-    // }
-    if (pata_stage(afl, in_buf, out_buf, len)) {
-      goto abandon_entry;
+    if (!(afl->fsrv.total_execs % afl->queued_items) ||
+          get_cur_time() - afl->last_find_time > 300000) {
+      if (pata_stage(afl, in_buf, out_buf, len)) {
+        goto abandon_entry;
+      }
     }
+    // if (pata_stage(afl, in_buf, out_buf, len)) {
+    //   goto abandon_entry;
+    // }
   }
 
   /* Go to pacemker fuzzing if MOpt is doing well */
