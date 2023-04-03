@@ -639,8 +639,7 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
 #undef NUM_PERTURB
 }
 
-static inline u8 is_meaningful_to_mutate(afl_state_t *afl,
-                                         const PataData &data,
+static inline u8 is_meaningful_to_mutate(const PataData &data,
                                          const UnstableVarTy &unstable_var,
                                          u8 solved) {
   return (solved == 0) &&
@@ -2547,18 +2546,18 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   for (auto &v : *RVS) {
     ++cur_idx;
     if (++afl->stage_cur % screen_update == 0) { show_stats(afl); }
-    if (!is_meaningful_to_mutate(afl, v, *unstable_var, (*solved)[cur_idx])) {
+    if (!is_meaningful_to_mutate(v, *unstable_var, (*solved)[cur_idx])) {
       continue;
-    }
-
-    if (cv->num_bf < 2) {
-      (*solved)[cur_idx] = 1;
     }
 
     orig_cov.clear();
     cv = &afl->pata_metadata[v.var_id];
     for (u32 i = 0; i < cv->num_bf; ++i) {
       orig_cov.push_back(afl->orig_map[cv->bf[i]]);
+    }
+
+    if (cv->num_bf < 2) {
+      (*solved)[cur_idx] = 1;
     }
 
     if (unlikely(length_explore(afl, buf, len, v, orig_cov, (*solved)[cur_idx], success))) {
