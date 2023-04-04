@@ -167,6 +167,7 @@ static void do_search(u8 *buf_begin, u8 *buf_end,
                       const std::vector<u8>::const_iterator &it_begin,
                       const std::vector<u8>::const_iterator &it_end,
                       std::vector<u8*> &res) {
+  res.clear();
   u8 *pos = buf_begin;
   while (true) {
     pos = std::search(pos, buf_end, it_begin, it_end);
@@ -583,8 +584,8 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
         }
         auto seq_it = seq.find(v.first);
         if (seq_it != seq.end()) {
-          auto len = MIN(v.second.size(), seq_it->second.size());
-          for (size_t i = 0; i < len; ++i) {
+          auto v_len = MIN(v.second.size(), seq_it->second.size());
+          for (size_t i = 0; i < v_len; ++i) {
             if (v.second[i]->lhs != seq_it->second[i]->lhs ||
                 v.second[i]->rhs != seq_it->second[i]->rhs) {
               auto index = std::make_pair(v.first, i);
@@ -1713,6 +1714,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
             return 1;
           }
           if (new_data.var_id != data.var_id) {
+            memcpy(buf, orig_buf, len);
             continue;
           }
 
