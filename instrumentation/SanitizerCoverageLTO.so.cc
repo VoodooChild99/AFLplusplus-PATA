@@ -69,23 +69,16 @@ extern "C" {
 #include <set>
 
 #define MEMCMP_FNAMES \
-  "memcmp", "bcmp", "CRYPTO_memcmp", "OPENSSL_memcmp", "memcmp_const_time", \
-  "memcmpct"
+  "memcmp", "bcmp"
 
 #define STRCMP_FNAMES \
-  "strcmp", "strcasecmp", "xmlStrcmp", "xmlStrEqual", "g_strcmp0",  \
-  "curl_strequal", "strcsequal", "stricmp", "ap_cstr_casecmp",  \
-  "OPENSSL_strcasecmp", "xmlStrcasecmp", "g_strcasecmp", "g_ascii_strcasecmp", \
-  "Curl_strcasecompare", "Curl_safe_strcasecompare", "cmsstrcasecmp"
+  "strcmp", "strcasecmp"
 
 #define STRSTR_FNAMES \
-  "strstr", "strcasestr", "g_strstr_len", "ap_strcasestr", "xmlStrstr", \
-  "xmlStrcasestr", "g_str_has_prefix", "g_str_has_suffix"
+  "strstr", "strcasestr"
 
 #define STRNCMP_FNAMES \
-  "strncmp", "strncasecmp", "xmlStrncmp", "curl_strnequal", "strnicmp", \
-  "ap_cstr_casecmpn", "OPENSSL_strncasecmp", "xmlStrncasecmp",  \
-  "g_ascii_strncasecmp", "Curl_strncasecompare", "g_strncasecmp"
+  "strncmp", "strncasecmp"
 
 #define MEMMEM_FNAMES \
   "memmem"
