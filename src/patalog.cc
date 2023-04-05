@@ -517,7 +517,7 @@ static u8 get_unstable_var(afl_state_t *afl, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
   total_time += (get_cur_time_us() - entry_time);
   ++total_execs;
-  if ((total_execs % 10000) == 0) {
+  if ((total_execs % 10) == 0) {
     printf("get_unstable_var: avg exec time: %lld us\n", total_time / total_execs);
   }
 #endif
@@ -544,12 +544,15 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
   static u64 total_time = 0;
   static u64 total_execs = 0;
-  u64 entry_time = get_cur_time_us();
+  u64 entry_time = 0;
 #endif
 
   for (u32 offset = 0; offset < len; ++offset) {
     orig_byte = buf[offset];
     for (u32 perturb = 0; perturb < NUM_PERTURB; ++perturb) {
+#ifdef PATA_PROFILE
+      entry_time = get_cur_time_us();
+#endif
       switch (perturb) {
         case 0:
           // bit flipping
@@ -600,6 +603,14 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
       }
       // recover the buffer
       buf[offset] = orig_byte;
+
+#ifdef PATA_PROFILE
+      total_time += (get_cur_time_us() - entry_time);
+      ++total_execs;
+      if ((total_execs % 1000) == 0) {
+        printf("collect_critical_bytes: avg exec time: %lld us\n", total_time / total_execs);
+      }
+#endif
 
       if (++afl->stage_cur % screen_update == 0) { show_stats(afl); }
     }
@@ -2423,7 +2434,7 @@ static u8 random_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
       total_time += (get_cur_time_us() - entry_time);
       ++total_execs;
-      if ((total_execs % 100) == 0) {
+      if ((total_execs % 1000) == 0) {
         printf("random_explore: avg exec time: %lld us\n", total_time / total_execs);
       }
 #endif
@@ -2438,7 +2449,7 @@ static u8 random_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
   total_time += (get_cur_time_us() - entry_time);
   ++total_execs;
-  if ((total_execs % 100) == 0) {
+  if ((total_execs % 1000) == 0) {
     printf("random_explore: avg exec time: %lld us\n", total_time / total_execs);
   }
 #endif
