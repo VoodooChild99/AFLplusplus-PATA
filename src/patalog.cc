@@ -5,15 +5,15 @@ extern "C" {
 
 }
 
-#include <map>
 #include <vector>
-#include <set>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <tuple>
 #include <type_traits>
 #include <iostream>
+#include <unordered_map>
+#include <unordered_set>
 
 struct PataData {
   u32 var_id;
@@ -22,11 +22,48 @@ struct PataData {
   std::vector<u8> rhs;
 };
 
-using PataDataSeq = std::vector<PataData>;
-using PataSeqPerVar = std::map<u32, std::vector<const PataData*>>;
-using UnstableVarTy = std::set<u32>;
-using CricBytesTy = std::map<std::pair<u32, u32>, std::vector<std::pair<u32, u32>>>;
+struct PataDataNoCopy {
+  u32 var_id;
+  u32 occur_id;
+  u32 lhs_len;
+  u32 rhs_len;
+  u8 *lhs;
+  u8 *rhs;
+};
 
+class PataDataNoCopyManager {
+private:
+  std::vector<PataDataNoCopy> placeholder;
+  u32 cursor;
+  u32 capacity;
+
+public:
+  PataDataNoCopyManager(u32 num) : placeholder(num), cursor(0), capacity(num) {}
+
+  PataDataNoCopy *borrow(u32 &idx) {
+    PataDataNoCopy *data;
+    if (unlikely(cursor >= capacity)) {
+      capacity += (capacity >> 1);
+      placeholder.resize(capacity);
+    }
+    data = &placeholder[cursor];
+    idx = cursor;
+    ++cursor;
+    // memset(data, 0, sizeof(*data));
+    return data;
+  }
+
+  void reset() { cursor = 0; }
+
+  PataDataNoCopy *get(u32 idx) { return &placeholder[idx]; }
+};
+
+using PataDataSeq = std::vector<PataData>;
+using PataSeqPerVar = std::unordered_map<u32, std::vector<const PataData*>>;
+using UnstableVarTy = std::unordered_set<u32>;
+using CricBytesTy = std::unordered_map<u32, std::vector<std::vector<std::pair<u32, u32>>>>;
+
+using PataSeqPerVarNoCopy = std::unordered_map<u32, std::vector<u32>>;
 static u64 screen_update;
 
 // #define PATA_DEBUG
@@ -70,6 +107,11 @@ void afl_pata_deinit(afl_state_t *afl) {
     }
     ck_free(afl->pata_metadata);
     afl->pata_metadata = nullptr;
+  }
+
+  if (afl->pata_data_ncpy_mngr) {
+    delete (PataDataNoCopyManager*)afl->pata_data_ncpy_mngr;
+    afl->pata_data_ncpy_mngr = nullptr;
   }
 }
 
@@ -203,10 +245,11 @@ get_seq_for_each_var(const PataDataSeq &RVS, PataSeqPerVar &seq) {
   u64 entry_time = get_cur_time_us();
 #endif
   for (auto &ds : RVS) {
-    if (seq.find(ds.var_id) == seq.end()) {
-      seq[ds.var_id] = std::vector<const PataData*>({&ds});
+    auto seq_it = seq.find(ds.var_id);
+    if (seq_it == seq.end()) {
+      seq.emplace(std::make_pair(ds.var_id, std::vector<const PataData*>{&ds}));
     } else {
-      seq[ds.var_id].push_back(&ds);
+      seq_it->second.push_back(&ds);
     }
   }
 #ifdef PATA_PROFILE
@@ -222,20 +265,21 @@ static void get_RVS_from_trace(afl_state_t *afl, PataDataSeq &RVS) {
   u32 num_records = *((u32*)afl->shm.pata_map);
   u8 *cursor = ((u8*)afl->shm.pata_map) + PATA_MAP_HEADER;
   u32 id;
-  std::map<u32, u32> id_occur_map;
-  PataData data;
+  std::unordered_map<u32, u32> id_occur_map;
   for (u32 i = 0; i < num_records; ++i) {
+    PataData data;
     id = *((u32*)cursor);
     cursor += sizeof(u32);
     const ConstraintVariable &cv = afl->pata_metadata[id];
     data.var_id = id;
     u32 occur_id;
-    if (id_occur_map.find(id) == id_occur_map.end()) {
+    auto id_occur_it = id_occur_map.find(id);
+    if (id_occur_it == id_occur_map.end()) {
       occur_id = 0;
-      id_occur_map[id] = 1;
+      id_occur_map.emplace(std::make_pair(id, 1));
     } else {
-      occur_id = id_occur_map[id];
-      id_occur_map[id] += 1;
+      occur_id = id_occur_it->second;
+      id_occur_it->second += 1;
     }
     data.occur_id = occur_id;
     switch(cv.kind) {
@@ -294,7 +338,7 @@ static void get_RVS_from_trace(afl_state_t *afl, PataDataSeq &RVS) {
       default:
         FATAL("Unrecognized PATA KIND %d", cv.kind);
     }
-    RVS.push_back(data);
+    RVS.emplace_back(data);
   }
 }
 
@@ -406,7 +450,120 @@ static void get_data_from_trace(afl_state_t *afl, const PataData &target,
   }
 }
 
+static void get_seq_for_each_var_no_copy(afl_state_t *afl,
+                                         PataSeqPerVarNoCopy &seq) {
+#ifdef PATA_PROFILE
+  static u64 total_time = 0;
+  static u64 total_execs = 0;
+  static u64 total_rep = 0;
+  u64 entry_time = get_cur_time_us();
+#endif
+  u32 num_records = *((u32*)afl->shm.pata_map);
+  u8 *cursor = ((u8*)afl->shm.pata_map) + PATA_MAP_HEADER;
+  u32 id, data_idx, occur_id;
+  std::unordered_map<u32, u32> id_occur_map;
+  PataDataNoCopy *data;
+  u64 len;
 
+  ((PataDataNoCopyManager*)afl->pata_data_ncpy_mngr)->reset();
+  for (u32 i = 0; i < num_records; ++i) {
+    data = ((PataDataNoCopyManager*)afl->pata_data_ncpy_mngr)->borrow(data_idx);
+    id = *((u32*)cursor);
+    cursor += sizeof(u32);
+    const ConstraintVariable &cv = afl->pata_metadata[id];
+    data->var_id = id;
+    auto id_occur_it = id_occur_map.find(id);
+    if (id_occur_it == id_occur_map.end()) {
+      occur_id = 0;
+      id_occur_map.emplace(std::make_pair(id, 1));
+    } else {
+      occur_id = id_occur_it->second;
+      id_occur_it->second += 1;
+    }
+    data->occur_id = occur_id;
+    switch(cv.kind) {
+      case PATA_KIND_CMP: {
+        data->lhs_len = cv.size;
+        data->rhs_len = cv.size;
+        data->lhs = cursor;
+        cursor += cv.size;
+        data->rhs = cursor;
+        cursor += cv.size;
+        break;
+      }
+      case PATA_KIND_SWITCH: {
+        data->lhs_len = cv.size;
+        data->rhs_len = 0;
+        data->lhs = cursor;
+        data->rhs = nullptr;
+        cursor += cv.size;
+        break;
+      }
+      case PATA_KIND_CALL: {
+        switch (cv.operation) {
+          case PATA_CALL_MEMCMP: {
+            len = *((u64*)cursor);
+            cursor += sizeof(u64);
+            data->lhs_len = len;
+            data->rhs_len = len;
+            data->lhs = cursor;
+            cursor += len;
+            data->rhs = cursor;
+            cursor += len;
+            break;
+          }
+          case PATA_CALL_STRNCMP: {
+            len = *((u64*)cursor);
+            cursor += sizeof(u64);
+            data->lhs_len = len;
+            data->lhs = cursor;
+            cursor += len;
+            len = *((u64*)cursor);
+            cursor += sizeof(u64);
+            data->rhs_len = len;
+            data->rhs = cursor;
+            cursor += len;
+            break;
+          }
+          case PATA_CALL_STRCMP:
+          case PATA_CALL_STRSTR:
+          case PATA_CALL_MEMMEM: {
+            len = *((u64*)cursor);
+            cursor += sizeof(u64);
+            data->lhs_len = len;
+            data->lhs = cursor;
+            cursor += len;
+            len = *((u64*)cursor);
+            cursor += sizeof(u64);
+            data->rhs_len = len;
+            data->rhs = cursor;
+            cursor += len;
+            break;
+          }
+          default:
+            FATAL("Unrecognized PATA_CALL Operation %d", cv.operation);
+        }
+        break;
+      }
+      default:
+        FATAL("Unrecognized PATA KIND %d", cv.kind);
+    }
+    auto seq_it = seq.find(id);
+    if (seq_it == seq.end()) {
+      seq.emplace(std::make_pair(id, std::vector<u32>{data_idx}));
+    } else {
+      seq_it->second.push_back(data_idx);
+    }
+  }
+#ifdef PATA_PROFILE
+  total_time += (get_cur_time_us() - entry_time);
+  ++total_execs;
+  total_rep += num_records;
+  if ((total_execs % 1000) == 0) {
+    printf("get_seq_for_each_var_no_copy: avg exec time: %lld us, avg #records: %lld\n", total_time / total_execs, total_rep / total_execs);
+  }
+#endif
+}
 
 static u8 get_RVS(afl_state_t *afl, u8 *buf, u32 len, PataDataSeq &RVS) {
 #ifdef PATA_PROFILE
@@ -459,8 +616,9 @@ get_specific_pata_data(afl_state_t *afl, u8 *buf, u32 len,
 static u8 get_unstable_var(afl_state_t *afl, u8 *buf, u32 len,
                            UnstableVarTy &unstable_var,
                            const PataSeqPerVar &orig_seq) {
-  PataDataSeq tmp_rvs;
-  PataSeqPerVar seq;
+  PataSeqPerVarNoCopy seq;
+  const PataData *tmp_pd;
+  const PataDataNoCopy *tmp_pd_ncpy;
 
 #ifdef PATA_PROFILE
   static u64 total_time = 0;
@@ -469,7 +627,6 @@ static u8 get_unstable_var(afl_state_t *afl, u8 *buf, u32 len,
 #endif
   
   for (u32 i = 0; i < CAL_CYCLES; ++i) {
-    tmp_rvs.clear();
     if (unlikely(common_fuzz_patalog_stuff_no_filter(afl, buf, len))) {
       return 1;
     }
@@ -478,16 +635,15 @@ static u8 get_unstable_var(afl_state_t *afl, u8 *buf, u32 len,
         continue;
       }
     }
-    get_RVS_from_trace(afl, tmp_rvs);
 
     seq.clear();
-    get_seq_for_each_var(tmp_rvs, seq);
+    get_seq_for_each_var_no_copy(afl, seq);
     // compare seq
     for (auto &v : orig_seq) {
       if (unstable_var.find(v.first) != unstable_var.end()) {
         continue;
       }
-      auto seq_it = seq.find(v.first);
+      auto const &seq_it = seq.find(v.first);
       if (seq_it == seq.end()) {
         // if the variable is not even shown, it's unstable
         unstable_var.insert(v.first);
@@ -499,8 +655,10 @@ static u8 get_unstable_var(afl_state_t *afl, u8 *buf, u32 len,
           unstable_var.insert(v.first);
         } else {
           for (size_t j = 0; j < seq_len; ++j) {
-            if (v.second[j]->lhs != seq_it->second[j]->lhs ||
-                v.second[j]->rhs != seq_it->second[j]->rhs) {
+            tmp_pd = v.second[j];
+            tmp_pd_ncpy = ((PataDataNoCopyManager*)afl->pata_data_ncpy_mngr)->get(seq_it->second[j]);
+            if ((tmp_pd->lhs.size() != tmp_pd_ncpy->lhs_len || (tmp_pd_ncpy->lhs_len && memcmp(tmp_pd->lhs.data(), tmp_pd_ncpy->lhs, tmp_pd_ncpy->lhs_len))) ||
+                (tmp_pd->rhs.size() != tmp_pd_ncpy->rhs_len || (tmp_pd_ncpy->rhs_len && memcmp(tmp_pd->rhs.data(), tmp_pd_ncpy->rhs, tmp_pd_ncpy->rhs_len)))) {
               unstable_var.insert(v.first);
               break;
             }
@@ -527,9 +685,10 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
 #define NUM_PERTURB   4
   
   u8 orig_byte;
-  PataSeqPerVar seq;
-  std::map<std::pair<u32, u32>, std::set<u32>> cric_bytes_tmp;
-  PataDataSeq tmp_rvs;
+  PataSeqPerVarNoCopy seq;
+  std::unordered_map<u32, std::vector<std::vector<u32>>> cric_bytes_tmp;
+  const PataData *tmp_pd;
+  const PataDataNoCopy *tmp_pd_ncpy;
 
   afl->stage_name = (u8*)"Critical Bytes";
   afl->stage_short = (u8*)"CB";
@@ -541,6 +700,10 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
   static u64 total_execs = 0;
   u64 entry_time = 0;
 #endif
+  for (auto &v : orig_seq) {
+    cric_bytes_tmp.emplace(std::make_pair(v.first, std::vector<std::vector<u32>>(v.second.size())));
+    cric_bytes.emplace(std::make_pair(v.first, std::vector<std::vector<std::pair<u32, u32>>>(v.second.size())));
+  }
 
   for (u32 offset = 0; offset < len; ++offset) {
     orig_byte = buf[offset];
@@ -566,32 +729,38 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
           buf[offset] = interesting_8[rand_below(afl, sizeof(interesting_8))];
           break;
       }
-      // execute it, get RVS
-      tmp_rvs.clear();
-      if (unlikely(get_RVS(afl, buf, len, tmp_rvs))) {
+
+      // execute it and get seq per var
+      if (unlikely(common_fuzz_patalog_stuff_no_filter(afl, buf, len))) {
         return 1;
       }
-      // get seq for each var
+      // do not process if the value tracking results does not change
+      if (*((u64*)afl->orig_pata_map) == *((u64*)afl->shm.pata_map)) {
+        if (!memcmp(afl->orig_pata_map, afl->shm.pata_map, ((u32*)afl->shm.pata_map)[1])) {
+          continue;
+        }
+      }
       seq.clear();
-      get_seq_for_each_var(tmp_rvs, seq);
+      get_seq_for_each_var_no_copy(afl, seq);
 
       // then compare
       for (auto &v : orig_seq) {
         if (unstable_var.find(v.first) != unstable_var.end()) {
           continue;
         }
-        auto seq_it = seq.find(v.first);
+        const auto &seq_it = seq.find(v.first);
         if (seq_it != seq.end()) {
           auto v_len = MIN(v.second.size(), seq_it->second.size());
           for (size_t i = 0; i < v_len; ++i) {
-            if (v.second[i]->lhs != seq_it->second[i]->lhs ||
-                v.second[i]->rhs != seq_it->second[i]->rhs) {
-              auto index = std::make_pair(v.first, i);
-              if (cric_bytes_tmp.find(index) == cric_bytes_tmp.end()) {
-                cric_bytes_tmp.insert(std::make_pair(index, std::set<u32>({offset})));
-              } else {
-                cric_bytes_tmp[index].insert(offset);
-              }
+            std::vector<u32> &offset_vec = cric_bytes_tmp[v.first][i];
+            if (!offset_vec.empty() && offset_vec.back() == offset) {
+              continue;
+            }
+            tmp_pd = v.second[i];
+            tmp_pd_ncpy = ((PataDataNoCopyManager*)afl->pata_data_ncpy_mngr)->get(seq_it->second[i]);
+            if ((tmp_pd->lhs.size() != tmp_pd_ncpy->lhs_len || (tmp_pd_ncpy->lhs_len && memcmp(tmp_pd->lhs.data(), tmp_pd_ncpy->lhs, tmp_pd_ncpy->lhs_len))) ||
+                (tmp_pd->rhs.size() != tmp_pd_ncpy->rhs_len || (tmp_pd_ncpy->rhs_len && memcmp(tmp_pd->rhs.data(), tmp_pd_ncpy->rhs, tmp_pd_ncpy->rhs_len)))) {
+              offset_vec.push_back(offset);
             }
           }
         }
@@ -612,35 +781,32 @@ collect_critical_bytes(afl_state_t *afl, u8 *buf, u32 len,
   }
 
   std::vector<std::pair<u32, u32>> sections;
-  for (auto &index : cric_bytes_tmp) {
-    sections.clear();
-    std::vector<u32> cbytes_sorted(index.second.begin(), index.second.end());
-    std::sort(cbytes_sorted.begin(), cbytes_sorted.end());
-    
-    auto num_offsets = cbytes_sorted.size();
-    u32 last_offset = cbytes_sorted[0];
-    u32 sec_len = 1;
-    for (u32 i = 1; i < num_offsets; ++i) {
-      if (cbytes_sorted[i] == cbytes_sorted[i - 1] + 1) {
-        ++sec_len;
+  u32 num_occur;
+  for (auto &var_id : cric_bytes_tmp) {
+    num_occur = var_id.second.size();
+    for (u32 i = 0; i < num_occur; ++i) {
+      std::vector<u32> &cbytes_sorted = var_id.second[i];
+      if (cbytes_sorted.empty()) {
         continue;
-      } else {
-        sections.push_back(std::make_pair(last_offset, sec_len));
-        last_offset = cbytes_sorted[i];
-        sec_len = 1;
       }
+      sections.clear();
+      auto num_offsets = cbytes_sorted.size();
+      u32 last_offset = cbytes_sorted[0];
+      u32 sec_len = 1;
+      for (u32 i = 1; i < num_offsets; ++i) {
+        if (cbytes_sorted[i] == cbytes_sorted[i - 1] + 1) {
+          ++sec_len;
+          continue;
+        } else {
+          sections.emplace_back(std::make_pair(last_offset, sec_len));
+          last_offset = cbytes_sorted[i];
+          sec_len = 1;
+        }
+      }
+      sections.emplace_back(std::make_pair(last_offset, sec_len));
+      cric_bytes[var_id.first][i] = std::move(sections);
     }
-    sections.push_back(std::make_pair(last_offset, sec_len));
-    cric_bytes[index.first] = sections;
   }
-
-#ifdef PATA_PROFILE
-  total_time += (get_cur_time_us() - entry_time);
-  ++total_execs;
-  if ((total_execs % 10) == 0) {
-    printf("collect_critical_bytes: avg exec time: %lld us\n", total_time / total_execs);
-  }
-#endif
 
   return 0;
 #undef NUM_PERTURB
@@ -1054,13 +1220,13 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 1: {
       if (rhs == lhs) {
         tmp = rhs + 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
         tmp = rhs - 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       }
       break;
@@ -1069,13 +1235,13 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 2: {
       tmp = rhs - 1.0;
       if (lhs > rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         tmp = rhs + 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1084,13 +1250,13 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 3: {
       tmp = rhs - 1.0;
       if (lhs >= rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
         tmp = rhs + 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1099,13 +1265,13 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 4: {
       tmp = rhs + 1.0;
       if (lhs < rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         tmp = rhs - 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1114,13 +1280,13 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 5: {
       tmp = rhs + 1.0;
       if (lhs <= rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
         tmp = rhs - 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1128,31 +1294,31 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     /* FCMP_ONE */
     case 6: {
       if (rhs != lhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         tmp = rhs + 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
         tmp = rhs - 1.0;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
     }
     /* FCMP_ORD */
     case 7: {
-      lhs_expected.push_back(
+      lhs_expected.emplace_back(
         std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       break;
     }
     /* FCMP_UNO */
     case 8: {
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
       }
       break;
@@ -1161,18 +1327,18 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 9: {
       tmp = rhs + 1.0;
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         if (lhs == rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1182,19 +1348,19 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 10: {
       tmp = rhs - 1.0;
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         if (lhs > rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
           tmp = rhs + 1.0;
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1204,19 +1370,19 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 11: {
       tmp = rhs - 1.0;
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         if (lhs >= rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
           tmp = rhs + 1.0;
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1226,19 +1392,19 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 12: {
       tmp = rhs + 1.0;
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         if (lhs < rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
           tmp = rhs - 1.0;
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1248,19 +1414,19 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     case 13: {
       tmp = rhs + 1.0;
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         if (lhs <= rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
           tmp = rhs - 1.0;
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1269,19 +1435,19 @@ calc_expected_value_for_fcmp(const ConstraintVariable &cv,
     /* FCMP_UNE */
     case 14: {
       if (lhs_nan) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         if (lhs != rhs) {
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         } else {
           tmp = rhs - 1.0;
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-          lhs_expected.push_back(
+          lhs_expected.emplace_back(
             std::vector<u8>(((u8*)(&nan)), ((u8*)(&nan)) + sizeof(T)));
         }
       }
@@ -1341,13 +1507,13 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     case 32: {
       if (lhs == rhs) {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       }
       break;
@@ -1355,14 +1521,14 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     /* ICMP_NE */
     case 33: {
       if (lhs != rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1371,14 +1537,14 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     case 34:
     case 38: {
       if (lhs > rhs) {
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1388,13 +1554,13 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     case 39: {
       if (lhs >= rhs) {
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       }
       break;
@@ -1404,13 +1570,13 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     case 40: {
       if (lhs < rhs) {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       } else {
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       }
       break;
@@ -1420,13 +1586,13 @@ calc_expected_value_for_icmp(const ConstraintVariable &cv,
     case 41: {
       if (lhs <= rhs) {
         tmp = rhs + 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
       } else {
         tmp = rhs - 1;
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&tmp)), ((u8*)(&tmp)) + sizeof(T)));
-        lhs_expected.push_back(
+        lhs_expected.emplace_back(
           std::vector<u8>(((u8*)(&rhs)), ((u8*)(&rhs)) + sizeof(T)));
       }
       break;
@@ -1478,7 +1644,7 @@ calc_expected_value_for_switch(const ConstraintVariable &cv,
   u32 num_cases = (cv.misc << 8 | cv.operation);
   u8 *cursor = (u8*)cv.opaque;
   for (u32 i = 0; i < num_cases; ++i) {
-    lhs_expected.push_back(std::vector<u8>(cursor, cursor + cv.size));
+    lhs_expected.emplace_back(std::vector<u8>(cursor, cursor + cv.size));
     cursor += cv.size;
   }
 }
@@ -1563,7 +1729,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
           }
         }
         for (auto r : res) {
-          lhs_pos.push_back(std::make_pair(r - buf, data.lhs.size()));
+          lhs_pos.emplace_back(std::make_pair(r - buf, data.lhs.size()));
         }
 
         if (cv.misc == 0) {
@@ -1576,7 +1742,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
             }
           }
           for (auto r : res) {
-            rhs_pos.push_back(std::make_pair(r - buf, data.rhs.size()));
+            rhs_pos.emplace_back(std::make_pair(r - buf, data.rhs.size()));
           }
         }
       }
@@ -1595,7 +1761,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
           }
         }
         for (auto r : res) {
-          lhs_pos.push_back(std::make_pair(r - buf, data.lhs.size()));
+          lhs_pos.emplace_back(std::make_pair(r - buf, data.lhs.size()));
         }
       }
       break;
@@ -1612,7 +1778,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
           }
         }
         for (auto r : res) {
-          lhs_pos.push_back(std::make_pair(r - buf, data.lhs.size()));
+          lhs_pos.emplace_back(std::make_pair(r - buf, data.lhs.size()));
         }
 
         do_search(buf_begin, buf_end, data.rhs.begin(), data.rhs.end(), res);
@@ -1623,7 +1789,7 @@ static u8 copy_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
           }
         }
         for (auto r : res) {
-          rhs_pos.push_back(std::make_pair(r - buf, data.rhs.size()));
+          rhs_pos.emplace_back(std::make_pair(r - buf, data.rhs.size()));
         }
       }
       break;
@@ -1862,7 +2028,7 @@ calc_move_operation_cmp(afl_state_t *afl, u8 *buf, u32 len, u32 offset,
   }
 
   success = true;
-  ops.push_back(std::make_tuple(offset, best_op, orig_gap - best_gap));
+  ops.emplace_back(std::make_tuple(offset, best_op, orig_gap - best_gap));
   return 0;
 }
 
@@ -1911,7 +2077,7 @@ calc_move_operation_switch(afl_state_t *afl, u8 *buf, u32 len, u32 offset,
   }
 
   success = true;
-  ops.push_back(std::make_tuple(offset, best_op, orig_gap - best_gap));
+  ops.emplace_back(std::make_tuple(offset, best_op, orig_gap - best_gap));
   return 0;
 }
 
@@ -2478,6 +2644,10 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
     screen_update = 100000;
 
+  }
+
+  if (unlikely(!afl->pata_data_ncpy_mngr)) {
+    afl->pata_data_ncpy_mngr = new PataDataNoCopyManager(65536);
   }
 
   // Get RVS for this testcase

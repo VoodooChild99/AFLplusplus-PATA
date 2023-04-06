@@ -690,6 +690,7 @@ typedef struct afl_state {
   struct cmp_map       *orig_cmp_map;
   u8                   *orig_pata_map;
   u8                   *orig_map;
+  void                 *pata_data_ncpy_mngr;
 
   u8 describe_op_buf_256[256]; /* describe_op will use this to return a string
                                   up to 256 */
