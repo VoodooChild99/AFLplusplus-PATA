@@ -201,7 +201,6 @@ struct queue_entry {
   u8             *cmplog_colorinput;    /* the result buf of colorization   */
   struct tainted *taint;                /* Taint information from CmpLog    */
   void           *RVS;                  /* RVS from patalog */
-  void           *seq_per_var;
   void           *unstable_var;
   void           *critical_bytes;
   void           *solved;

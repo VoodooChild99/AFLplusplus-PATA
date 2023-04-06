@@ -34,11 +34,6 @@ static u64 screen_update;
 
 extern "C"
 void afl_pata_on_queue_entry_destroy(struct queue_entry *q) {
-  if (q->seq_per_var) {
-    delete (PataSeqPerVar*)q->seq_per_var;
-    q->seq_per_var = nullptr;
-  }
-
   if (q->RVS) {
     delete (PataDataSeq*)q->RVS;
     q->RVS = nullptr;
@@ -2459,7 +2454,7 @@ static u8 random_explore(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len,
 
 extern "C"
 u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
-  const PataSeqPerVar *seq_per_var;
+  PataSeqPerVar seq_per_var;
   const PataDataSeq *RVS;
   const CricBytesTy *cric_bytes;
   const UnstableVarTy *unstable_var;
@@ -2489,10 +2484,10 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   if (!afl->queue_cur->RVS) {
     afl->queue_cur->RVS = new PataDataSeq();
     if (unlikely(get_RVS(afl, buf, len, *(PataDataSeq*)afl->queue_cur->RVS))) {
-      delete (PataDataSeq*)afl->queue_cur->RVS;
-      afl->queue_cur->RVS = nullptr;
+      afl_pata_on_queue_entry_destroy(afl->queue_cur);
       return 1;
     }
+    get_seq_for_each_var(*(PataDataSeq*)afl->queue_cur->RVS, seq_per_var);
   }
   RVS = (PataDataSeq*)afl->queue_cur->RVS;
 
@@ -2517,20 +2512,12 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   }
   memcpy(afl->orig_map, afl->fsrv.trace_bits, afl->patalog_fsrv.map_size);
 
-  // Get sequence for each variable
-  if (!afl->queue_cur->seq_per_var) {
-    afl->queue_cur->seq_per_var = new PataSeqPerVar();
-    get_seq_for_each_var(*RVS, *(PataSeqPerVar*)afl->queue_cur->seq_per_var);
-  }
-  seq_per_var = (PataSeqPerVar*)afl->queue_cur->seq_per_var;
-
   // Get unstable variable
   if (!afl->queue_cur->unstable_var) {
     afl->queue_cur->unstable_var = new UnstableVarTy();
     if (unlikely(get_unstable_var(afl, buf, len,
-        *(UnstableVarTy*)afl->queue_cur->unstable_var, *seq_per_var))) {
-      delete (UnstableVarTy*)afl->queue_cur->unstable_var;
-      afl->queue_cur->unstable_var = nullptr;
+        *(UnstableVarTy*)afl->queue_cur->unstable_var, seq_per_var))) {
+      afl_pata_on_queue_entry_destroy(afl->queue_cur);
       return 1;
     }
   }
@@ -2540,12 +2527,12 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   if (!afl->queue_cur->critical_bytes) {
     afl->queue_cur->critical_bytes = new CricBytesTy();
     if (unlikely(collect_critical_bytes(afl, buf, len, *unstable_var,
-        *seq_per_var, *(CricBytesTy*)afl->queue_cur->critical_bytes))) {
-        delete (CricBytesTy*)afl->queue_cur->critical_bytes;
-        afl->queue_cur->critical_bytes = nullptr;
+        seq_per_var, *(CricBytesTy*)afl->queue_cur->critical_bytes))) {
+        afl_pata_on_queue_entry_destroy(afl->queue_cur);
         return 1;
     }
   }
+  if (!seq_per_var.empty()) { seq_per_var.clear(); }
   cric_bytes = (CricBytesTy*)afl->queue_cur->critical_bytes;
 
   u32 cur_idx = 0xFFFFFFFF;
