@@ -2493,10 +2493,8 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   // init solved
   if (!afl->queue_cur->solved) {
-    afl->queue_cur->solved = new std::vector<u8>();
+    afl->queue_cur->solved = new std::vector<u8>(RVS->size(), 0);
     solved = (std::vector<u8>*)afl->queue_cur->solved;
-    solved->reserve(RVS->size());
-    std::fill(solved->begin(), solved->end(), 0);
   }
   solved = (std::vector<u8>*)afl->queue_cur->solved;
 
