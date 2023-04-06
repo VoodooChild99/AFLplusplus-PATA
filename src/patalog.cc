@@ -453,7 +453,7 @@ get_specific_pata_data(afl_state_t *afl, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
   total_time += (get_cur_time_us() - entry_time);
   ++total_execs;
-  if ((total_execs % 10000) == 0) {
+  if ((total_execs % 100000) == 0) {
     printf("get_specific_pata_data: avg exec time: %lld us\n", total_time / total_execs);
   }
 #endif
@@ -2016,7 +2016,7 @@ do_linear_search_cmp(afl_state_t *afl, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
         total_time += (get_cur_time_us() - entry_time);
         ++total_execs;
-        if ((total_execs % 100) == 0) {
+        if ((total_execs % 1000) == 0) {
           printf("do_linear_search_cmp: avg exec time: %lld us\n", total_time / total_execs);
         }
 #endif
@@ -2045,7 +2045,7 @@ do_linear_search_cmp(afl_state_t *afl, u8 *buf, u32 len,
 #ifdef PATA_PROFILE
   total_time += (get_cur_time_us() - entry_time);
   ++total_execs;
-  if ((total_execs % 100) == 0) {
+  if ((total_execs % 1000) == 0) {
     printf("do_linear_search_cmp: avg exec time: %lld us\n", total_time / total_execs);
   }
 #endif
