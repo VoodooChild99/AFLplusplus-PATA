@@ -64,6 +64,8 @@ using UnstableVarTy = std::unordered_set<u32>;
 using CricBytesTy = std::unordered_map<u32, std::vector<std::vector<std::pair<u32, u32>>>>;
 
 using PataSeqPerVarNoCopy = std::unordered_map<u32, std::vector<u32>>;
+using RemovedOccurrenceTy = std::unordered_map<u32, u32>;
+
 static u64 screen_update;
 
 // #define PATA_DEBUG
@@ -89,6 +91,11 @@ void afl_pata_on_queue_entry_destroy(struct queue_entry *q) {
   if (q->solved) {
     delete (std::vector<u8>*)q->solved;
     q->solved = nullptr;
+  }
+
+  if (q->removed_occurrence) {
+    delete (RemovedOccurrenceTy*)q->removed_occurrence;
+    q->removed_occurrence = nullptr;
   }
 }
 
@@ -2658,6 +2665,10 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
       return 1;
     }
     get_seq_for_each_var(*(PataDataSeq*)afl->queue_cur->RVS, seq_per_var);
+    afl->queue_cur->removed_occurrence = new RemovedOccurrenceTy();
+    for (auto &v : seq_per_var) {
+      ((RemovedOccurrenceTy*)afl->queue_cur->removed_occurrence)->emplace(std::make_pair(v.first, 0));
+    }
   }
   RVS = (PataDataSeq*)afl->queue_cur->RVS;
 
@@ -2711,6 +2722,9 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   afl->stage_max = RVS->size();
   afl->stage_cur = 0;
 
+  std::vector<u32> idx_to_delete;
+  u8 ret = 0;
+
   for (auto &v : *RVS) {
     ++cur_idx;
     if (++afl->stage_cur % screen_update == 0) { show_stats(afl); }
@@ -2729,43 +2743,91 @@ u8 pata_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
     }
 
     if (unlikely(length_explore(afl, buf, len, v, orig_cov, (*solved)[cur_idx], success))) {
-      return 1;
+      ret = 1;
+      break;
     }
     if (success) {
+      if ((*solved)[cur_idx]) {
+        idx_to_delete.push_back(cur_idx);
+      }
       continue;
     }
 
-    auto index = std::make_pair(v.var_id, v.occur_id);
-    auto cric_it = cric_bytes->find(index);
-    if (cric_it == cric_bytes->end()) {
+    const auto &cric_var_it = cric_bytes->find(v.var_id);
+    if (cric_var_it == cric_bytes->end()) {
       continue;
     }
-    auto &cbytes = cric_it->second;
+
+    const auto &cbytes = cric_var_it->second[v.occur_id];
     if (cbytes.empty()) {
       continue;
     }
 
     if (unlikely(copy_explore(afl, orig_buf, buf, len, v, cbytes, orig_cov, (*solved)[cur_idx], success))) {
-      return 1;
+      ret = 1;
+      break;
     }
     if (success) {
+      if ((*solved)[cur_idx]) {
+        idx_to_delete.push_back(cur_idx);
+      }
       continue;
     }
 
     if (unlikely(linear_search(afl, orig_buf, buf, len, v, cbytes, orig_cov, (*solved)[cur_idx], success))) {
-      return 1;
+      ret = 1;
+      break;
     }
     if (success) {
+      if ((*solved)[cur_idx]) {
+        idx_to_delete.push_back(cur_idx);
+      }
       memcpy(buf, orig_buf, len);
       continue;
     }
 
     if (unlikely(random_explore(afl, orig_buf, buf, len, v, cbytes, orig_cov, (*solved)[cur_idx]))) {
-      return 1;
+      ret = 1;
+      break;
+    }
+
+    if ((*solved)[cur_idx]) {
+      idx_to_delete.push_back(cur_idx);
     }
 
     memcpy(buf, orig_buf, len);
   }
 
-  return 0;
+  // delete solved data
+  CricBytesTy &cric_bytes_non_const = *((CricBytesTy*)afl->queue_cur->critical_bytes);
+  PataDataSeq &RVS_non_const = *((PataDataSeq*)afl->queue_cur->RVS);
+  RemovedOccurrenceTy &removed = *((RemovedOccurrenceTy*)afl->queue_cur->removed_occurrence);
+  u32 deleted = 0;
+  for (auto idx : idx_to_delete) {
+    u32 real_idx = idx - deleted;
+    ++deleted;
+    // delete solved
+    solved->erase(solved->begin() + real_idx);
+    {
+      const PataData &data = RVS_non_const[real_idx];
+      // delete critical_bytes
+      cric_bytes_non_const[data.var_id][data.occur_id].clear();
+      removed[data.var_id] += 1;
+    }
+    // delete RVS
+    RVS_non_const.erase(RVS_non_const.begin() + real_idx);
+  }
+
+  if (!idx_to_delete.empty()) {
+    for (auto rit = removed.begin(); rit != removed.end(); ) {
+      if (cric_bytes_non_const[rit->first].size() == rit->second) {
+        cric_bytes_non_const.erase(rit->first);
+        rit = removed.erase(rit);
+      } else {
+        ++rit;
+      }
+    }
+  }
+
+  return ret;
 }

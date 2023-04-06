@@ -204,6 +204,7 @@ struct queue_entry {
   void           *unstable_var;
   void           *critical_bytes;
   void           *solved;
+  void           *removed_occurrence;
 
   struct queue_entry *mother;           /* queue entry this based on        */
 
